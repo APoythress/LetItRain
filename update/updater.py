@@ -4,7 +4,7 @@ import ujson
 import utime
 import os
 
-VERSION_URL = "https://raw.githubusercontent.com/APoythress/LetItRain/main/version.json"
+VERSION_URL = "http://raw.githubusercontent.com/APoythress/LetItRain/main/version.json"
 LOCAL_VERSION_FILE = "version.json"
 UPDATE_STATUS_FILE = "update_status.json"
 
