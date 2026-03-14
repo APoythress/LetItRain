@@ -1,0 +1,23 @@
+{
+  "device_name": "Pico Sprinkler Controller",
+  "relay_pin": 15,
+  "relay_active_high": true,
+  "manual_default_duration_minutes": 10,
+  "schedule": {
+    "enabled": false,
+    "days": [
+      0,
+      2,
+      5
+    ],
+    "start_hour": 6,
+    "start_minute": 0,
+    "duration_minutes": 15
+  },
+  "last_run": {
+    "start_epoch": null,
+    "end_epoch": null,
+    "mode": null,
+    "status": null
+  }
+}
