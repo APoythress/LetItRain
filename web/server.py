@@ -29,11 +29,24 @@ def parse_query(path):
 
     route, query = path.split("?", 1)
     params = {}
+
     for pair in query.split("&"):
         if "=" in pair:
             k, v = pair.split("=", 1)
-            params[k] = v
+
+            # basic decode for this project
+            v = v.replace("%3A", ":").replace("%2C", ",").replace("+", " ")
+
+            if k in params:
+                if isinstance(params[k], list):
+                    params[k].append(v)
+                else:
+                    params[k] = [params[k], v]
+            else:
+                params[k] = v
+
     return route, params
+
 
 def http_response(body, content_type="text/html"):
     return "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nConnection: close\r\n\r\n{}".format(content_type, body)
@@ -109,15 +122,51 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop, on_sync_rtc)
 
             # Manual save 
             elif route == "/save":
-                schedule = config["schedule"]
-                schedule["enabled"] = params.get("enabled", "0") == "1"
-                days_csv = params.get("days", "")
-                schedule["days"] = [int(x) for x in days_csv.split(",") if x.strip() != ""]
-                schedule["start_hour"] = int(params.get("hour", schedule.get("start_hour", 6)))
-                schedule["start_minute"] = int(params.get("minute", schedule.get("start_minute", 0)))
-                schedule["duration_minutes"] = int(params.get("duration", schedule.get("duration_minutes", 10)))
-                save_config(config)
-                client.send(redirect().encode())
+                try:
+                    schedule = config["schedule"]
+
+                    enabled_raw = str(params.get("enabled", "0")).strip()
+                    appt_raw = str(params.get("appt", "06:00")).strip()
+                    duration_raw = str(params.get("duration", str(schedule.get("duration_minutes", 10)))).strip()
+
+                    days_raw = params.get("days", [])
+                    if not isinstance(days_raw, list):
+                        days_raw = [days_raw]
+
+                    print("SAVE PARAMS:")
+                    print("enabled =", enabled_raw)
+                    print("days    =", days_raw)
+                    print("appt    =", appt_raw)
+                    print("duration=", duration_raw)
+
+                    schedule["enabled"] = enabled_raw == "1"
+
+                    day_list = []
+                    for x in days_raw:
+                        x = str(x).strip()
+                        if x != "":
+                            day_list.append(int(x))
+                    schedule["days"] = sorted(day_list)
+
+                    if ":" not in appt_raw:
+                        raise ValueError("Time must be in HH:MM format")
+
+                    hour_str, minute_str = appt_raw.split(":", 1)
+                    schedule["start_hour"] = int(hour_str)
+                    schedule["start_minute"] = int(minute_str)
+                    schedule["duration_minutes"] = int(duration_raw)
+
+                    print("NEW SCHEDULE =", schedule)
+
+                    save_config(config)
+                    client.send(redirect().encode())
+
+                except Exception as ex:
+                    print("SAVE ERROR:", ex)
+                    client.send(http_response(
+                        "<h1>Save Error</h1><pre>{}</pre><p><a href='/'>Back</a></p>".format(str(ex))
+                    ).encode())
+
 
             # Dashboard
             else:
