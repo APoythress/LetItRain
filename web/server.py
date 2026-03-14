@@ -74,8 +74,14 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop, on_sync_rtc)
                 client.send(http_response(
                     "<html><body><h1>Update Started</h1><p>Check the dashboard again in a few seconds.</p></body></html>"
                 ).encode())
+
                 client.close()
-                check_for_update()
+                client = None
+
+                try:
+                    check_for_update()
+                except Exception as ex:
+                    print("Update failed:", ex)
                 continue
 
             # Manually sync rtc
@@ -130,7 +136,15 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop, on_sync_rtc)
                 utime.sleep_ms(50)
 
         except Exception as ex:
-            client.send(http_response("<h1>Error</h1><pre>{}</pre>".format(str(ex))).encode())
+            print("Server error:", ex)
+            try:
+                if client is not None:
+                    client.send(http_response(
+                        "<h1>Error</h1><pre>{}</pre>".format(str(ex))
+                    ).encode())
+            except Exception as send_ex:
+                print("Could not send error response:", send_ex)
+
         
         finally:
             try:
