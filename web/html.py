@@ -65,6 +65,7 @@ def render_dashboard(config, state, now_iso, next_run_epoch):
         <a class="btn" href="/start">Start Now</a>
         <a class="btn" href="/stop">Stop Now</a>
         <a class="btn" href"/update">Check For Update</a>
+        <a class="btn" href="/sync-rtc">Sync RTC</a>
     </div>
 
     <div class="card">

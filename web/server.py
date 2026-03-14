@@ -41,7 +41,7 @@ def http_response(body, content_type="text/html"):
 def redirect(location="/"):
     return "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n".format(location)
 
-def run_server(config, state, rtc, on_manual_start, on_manual_stop):
+def run_server(config, state, rtc, on_manual_start, on_manual_stop, on_sync_rtc):
     addr = socket.getaddrinfo("0.0.0.0", 8080)[0][-1]
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -77,6 +77,18 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop):
                 client.close()
                 check_for_update()
                 continue
+
+            # Manually sync rtc
+            elif route == "/sync-rtc":
+                try:
+                    new_time = on_sync_rtc()
+                    client.send(http_response(
+                        "<html><body><h1>RTC Synced</h1><p>New RTC time: {}</p><p><a href='/'>Back</a></p></body></html>".format(new_time)
+                    ).encode())
+                except Exception as ex:
+                    client.send(http_response(
+                        "<html><body><h1>RTC Sync Error</h1><pre>{}</pre><p><a href='/'>Back</a></p></body></html>".format(str(ex))
+                    ).encode())
 
 
             # Manual start

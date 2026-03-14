@@ -1,5 +1,6 @@
 import utime
 from machine import I2C, Pin
+import ntptime
 
 from secrets import WIFI_SSID, WIFI_PASSWORD
 from hardware.relay import RelayController
@@ -37,6 +38,25 @@ def get_now_iso():
     return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
         t[0], t[1], t[2], t[3], t[4], t[5]
     )
+
+# Function to sync clock
+def sync_rtc_from_ntp():
+    if rtc is None:
+        raise RuntimeError("RTC not initialized")
+
+    ntptime.settime()
+    t = utime.localtime(utime.time() - 5 * 3600)  # EST
+    year = t[0]
+    month = t[1]
+    day = t[2]
+    hour = t[3]
+    minute = t[4]
+    second = t[5]
+    weekday = t[6] + 1
+
+    rtc.set_datetime(year, month, day, hour, minute, second, weekday)
+    return rtc.iso_string()
+
 
 
 def persist_last_run(start_epoch, end_epoch, mode, status):
@@ -82,11 +102,7 @@ def start_web_server():
     try:
         wlan = connect_wifi(WIFI_SSID, WIFI_PASSWORD)
         print("Wi-Fi connected:", wlan.ifconfig())
-        run_server(config, 
-                   state, 
-                   rtc, 
-                   on_manual_start, 
-                   on_manual_stop)
+        run_server(config, state, rtc, on_manual_start, on_manual_stop, sync_rtc_from_ntp)
     
     except Exception as ex:
         print("Web server unavailable:", ex)
