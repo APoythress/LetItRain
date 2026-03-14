@@ -4,6 +4,7 @@ import utime
 from core.scheduler import next_run_epoch
 from web.html import render_dashboard
 from storage.config_store import save_config
+from update.updater import check_for_update
 
 def connect_wifi(ssid, password, timeout_seconds=20):
     wlan = network.WLAN(network.STA_IF)
@@ -67,12 +68,28 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop):
 
             if route == "/favicon.ico":
                 client.send(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            
+            # Manual update trigger
+            elif route == "/update":
+                client.send(http_response(
+                    "<html><body><h1>Update Started</h1><p>Check the dashboard again in a few seconds.</p></body></html>"
+                ).encode())
+                client.close()
+                check_for_update()
+                continue
+
+
+            # Manual start
             elif route == "/start":
                 on_manual_start()
                 client.send(redirect().encode())
+
+            # Manual stop
             elif route == "/stop":
                 on_manual_stop()
                 client.send(redirect().encode())
+
+            # Manual save 
             elif route == "/save":
                 schedule = config["schedule"]
                 schedule["enabled"] = params.get("enabled", "0") == "1"
@@ -83,6 +100,8 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop):
                 schedule["duration_minutes"] = int(params.get("duration", schedule.get("duration_minutes", 10)))
                 save_config(config)
                 client.send(redirect().encode())
+
+            # Dashboard
             else:
                 now_epoch = rtc.epoch()
                 now_iso = rtc.iso_string()
@@ -97,8 +116,10 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop):
                 response = http_response(body).encode()
                 client.send(response)
                 utime.sleep_ms(50)
+
         except Exception as ex:
             client.send(http_response("<h1>Error</h1><pre>{}</pre>".format(str(ex))).encode())
+        
         finally:
             try:
                 client.close()

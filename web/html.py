@@ -1,4 +1,25 @@
 from core.time_utils import epoch_to_iso, hhmm_string, DAY_NAMES
+import ujson
+
+# Helpers for version and update status
+def get_local_version():
+    try:
+        with open("version.json", "r") as f:
+            data = ujson.load(f)
+            return data.get("version", "0.0.0")
+    except:
+        return "unknown"
+
+def get_update_status():
+    try:
+        with open("update_status.json", "r") as f:
+            return ujson.load(f)
+    except:
+        return {
+            "status": "unknown",
+            "message": "No update status available."
+        }
+
 
 def render_dashboard(config, state, now_iso, next_run_epoch):
     schedule = config.get("schedule", {})
@@ -7,6 +28,16 @@ def render_dashboard(config, state, now_iso, next_run_epoch):
 
     last_run = config.get("last_run", {})
     current_end = state.run_end_epoch()
+
+    # Version / update
+    local_version = get_local_version()
+    update_status = get_update_status()
+    update_state = update_status.get("status", "unknown")
+    update_message = update_status.get("message", "")
+
+    local_version=local_version,
+    update_state=update_state,
+    update_message=update_message,
 
     return """<!DOCTYPE html>
 <html>
@@ -33,6 +64,7 @@ def render_dashboard(config, state, now_iso, next_run_epoch):
         <p><strong>Next run:</strong> {next_run}</p>
         <a class="btn" href="/start">Start Now</a>
         <a class="btn" href="/stop">Stop Now</a>
+        <a class="btn" href"/update">Check For Update</a>
     </div>
 
     <div class="card">

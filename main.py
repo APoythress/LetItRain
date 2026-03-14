@@ -8,6 +8,8 @@ from storage.config_store import load_config, save_config
 from core.state import ControllerState
 from core.scheduler import should_start_now, should_stop_now
 from web.server import connect_wifi, run_server
+from update.updater import check_for_update
+
 
 config = load_config()
 state = ControllerState()
@@ -80,7 +82,12 @@ def start_web_server():
     try:
         wlan = connect_wifi(WIFI_SSID, WIFI_PASSWORD)
         print("Wi-Fi connected:", wlan.ifconfig())
-        run_server(config, state, rtc, on_manual_start, on_manual_stop)
+        run_server(config, 
+                   state, 
+                   rtc, 
+                   on_manual_start, 
+                   on_manual_stop)
+    
     except Exception as ex:
         print("Web server unavailable:", ex)
 
