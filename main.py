@@ -92,7 +92,7 @@ def stop_run(status="completed"):
     print("Run stopped:", status, "at", get_now_iso())
 
 def on_manual_start():
-    minutes = config.get("manual_default_duration_minutes", 10)
+    minutes = config.get("manual_default_duration_minutes", 30)
     start_run(minutes * 60, "manual")
 
 def on_manual_stop():
