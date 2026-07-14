@@ -51,7 +51,7 @@ def _parse_request(raw):
 
 
 def run_server(config, state, rtc, on_manual_start, on_manual_stop,
-               local_override, save_config_fn):
+               local_override, save_config_fn, now_fn, firmware_version):
     addr = usocket.getaddrinfo("0.0.0.0", 80)[0][-1]
     server = usocket.socket()
     server.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
@@ -83,6 +83,8 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
                     "active_skip":        local_override["skip_today"],
                     "active_skip_reason": local_override["skip_reason"],
                     "device_online":      True,
+                    "last_heartbeat":     now_fn(),
+                    "firmware_version":   firmware_version,
                 })
 
             elif method == "GET" and path == "/config":

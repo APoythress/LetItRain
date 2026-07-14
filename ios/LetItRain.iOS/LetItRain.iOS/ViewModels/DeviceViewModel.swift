@@ -12,6 +12,7 @@ final class DeviceViewModel: ObservableObject {
     @Published var isLoading:       Bool          = false
     @Published var errorMessage:    String?       = nil
     @Published var successMessage:  String?       = nil
+    @Published var otaStatus:       OTAStatus     = .idle
 
     let scheduleVM = ScheduleViewModel()
 
@@ -27,6 +28,7 @@ final class DeviceViewModel: ObservableObject {
         observeModeChanges()
         observeFirebaseStatus()
         observeFirebaseConfig()
+        observeFirebaseOTAStatus()
         wireScheduleVM()
     }
 
@@ -71,6 +73,15 @@ final class DeviceViewModel: ObservableObject {
                     self.scheduleVM.load(from: cfg)
                 }
             }
+            .store(in: &cancellables)
+    }
+
+    private func observeFirebaseOTAStatus() {
+        // OTA status only ever comes from Firebase -- the Pico has no local
+        // HTTP endpoint for it -- so mirror it regardless of local/remote mode.
+        firebaseRepository.$otaStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] s in self?.otaStatus = s }
             .store(in: &cancellables)
     }
 
@@ -181,6 +192,17 @@ final class DeviceViewModel: ObservableObject {
                     try await firebaseRepository.cancelSkip()
                 }
                 successMessage = "Skip cancelled."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    func checkForUpdate() {
+        Task {
+            isLoading = true
+            do {
+                try await firebaseRepository.requestUpdateCheck()
+                successMessage = "Checking for update..."
             } catch { handleError(error) }
             isLoading = false
         }

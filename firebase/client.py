@@ -44,6 +44,13 @@ class FirebaseClient:
         self._id_token     = None
         self._token_issued = 0   # utime.time() when token was obtained
 
+    @property
+    def id_token(self):
+        """Current Firebase Auth ID token, or None if not authenticated yet.
+        Exposed for other Firebase REST APIs (e.g. Cloud Storage) that need
+        the same token but aren't part of the Realtime Database surface."""
+        return self._id_token
+
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
@@ -117,6 +124,11 @@ class FirebaseClient:
         self._refresh_if_needed()
         try:
             resp = requests.get(self._url(path), timeout=_REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                print("Firebase: get({}) status {} body {}".format(
+                    path, resp.status_code, resp.text))
+                resp.close()
+                return None
             data = resp.json()
             resp.close()
             return data
@@ -144,9 +156,10 @@ class FirebaseClient:
                 timeout=_REQUEST_TIMEOUT,
             )
             ok = resp.status_code == 200
-            resp.close()
             if not ok:
-                print("Firebase: patch({}) status {}".format(path, resp.status_code))
+                print("Firebase: patch({}) status {} body {}".format(
+                    path, resp.status_code, resp.text))
+            resp.close()
             return ok
         except Exception as ex:
             print("Firebase: patch({}) exception: {}".format(path, ex))

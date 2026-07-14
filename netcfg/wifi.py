@@ -7,7 +7,7 @@ import network
 import utime
 
 
-def connect_wifi(ssid, password, max_attempts=20, delay_ms=500):
+def connect_wifi(ssid, password, max_attempts=20, delay_ms=500, on_wait=None):
     """
     Connect to Wi-Fi and return the wlan interface object.
 
@@ -16,6 +16,9 @@ def connect_wifi(ssid, password, max_attempts=20, delay_ms=500):
         password:     Wi-Fi password
         max_attempts: Number of times to check for connection before giving up
         delay_ms:     Milliseconds to wait between checks
+        on_wait:      Optional no-arg callback invoked every ~50ms while waiting
+                      (e.g. status_led.tick) so callers can keep other periodic
+                      work — like LED patterns — running during this blocking call.
 
     Returns:
         wlan object (already connected)
@@ -40,8 +43,21 @@ def connect_wifi(ssid, password, max_attempts=20, delay_ms=500):
             return wlan
         status = wlan.status()
         print("  Waiting... status={} attempt={}/{}".format(status, attempt + 1, max_attempts))
-        utime.sleep_ms(delay_ms)
+        _wait_with_ticks(delay_ms, on_wait)
 
     raise RuntimeError(
         "Wi-Fi connection failed after {} attempts. SSID: {}".format(max_attempts, ssid)
     )
+
+
+def _wait_with_ticks(delay_ms, on_wait, step_ms=50):
+    """Sleep delay_ms total, calling on_wait every step_ms if given."""
+    if not on_wait:
+        utime.sleep_ms(delay_ms)
+        return
+    remaining = delay_ms
+    while remaining > 0:
+        on_wait()
+        step = step_ms if remaining >= step_ms else remaining
+        utime.sleep_ms(step)
+        remaining -= step

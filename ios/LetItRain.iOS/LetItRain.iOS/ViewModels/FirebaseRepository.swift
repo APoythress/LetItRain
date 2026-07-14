@@ -10,9 +10,10 @@ import FirebaseAuth
 @MainActor
 final class FirebaseRepository: ObservableObject {
 
-    @Published var status: DeviceStatus  = .placeholder
-    @Published var meta:   DeviceMeta?   = nil
-    @Published var config: DeviceConfig? = nil
+    @Published var status:    DeviceStatus  = .placeholder
+    @Published var meta:      DeviceMeta?   = nil
+    @Published var config:    DeviceConfig? = nil
+    @Published var otaStatus: OTAStatus     = .idle
 
     private let devicePath = "devices/pico-zone-1"
     private var handles: [DatabaseHandle] = []
@@ -57,7 +58,15 @@ final class FirebaseRepository: ObservableObject {
             }
         }
 
-        handles = [sh, mh, zh, sch]
+        // OTA update status
+        let uh = db.child("\(devicePath)/update").observe(.value) { [weak self] snap in
+            guard let self, let dict = snap.value as? [String: Any] else { return }
+            Task { @MainActor [weak self] in
+                self?.otaStatus = self?.decode(OTAStatus.self, from: dict) ?? .idle
+            }
+        }
+
+        handles = [sh, mh, zh, sch, uh]
     }
 
     func stopListening() {
@@ -168,6 +177,14 @@ final class FirebaseRepository: ObservableObject {
             "skip_date":   NSNull(),
             "skip_reason": NSNull(),
         ] as [String: Any])
+    }
+
+    // MARK: - OTA update
+
+    /// Ask the Pico to check for a firmware update right now instead of waiting
+    /// for its periodic timer. The Pico clears `requested` as soon as it sees it.
+    func requestUpdateCheck() async throws {
+        try await db.child("\(devicePath)/update").updateChildValues(["requested": true])
     }
 
     // MARK: - FCM token

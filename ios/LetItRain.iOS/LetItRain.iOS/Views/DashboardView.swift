@@ -315,9 +315,38 @@ struct DashboardView: View {
             if let zones = deviceVM.config?.enabledZones, !zones.isEmpty {
                 infoRow("Zones", value: zones.map(\.name).joined(separator: ", "))
             }
+
+            updateRow
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(hex: "0F2038")).cornerRadius(16)
+    }
+
+    // MARK: - OTA update row
+
+    @ViewBuilder
+    private var updateRow: some View {
+        Divider().background(Color.white.opacity(0.1)).padding(.vertical, 2)
+
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Software Update").font(.subheadline).foregroundColor(.white.opacity(0.5))
+                if let message = deviceVM.otaStatus.message, deviceVM.otaStatus.status != "idle" {
+                    Text(message).font(.caption2).foregroundColor(.white.opacity(0.4))
+                }
+            }
+            Spacer()
+            Button {
+                deviceVM.checkForUpdate()
+            } label: {
+                if deviceVM.otaStatus.isInProgress {
+                    ProgressView().tint(.white.opacity(0.6))
+                } else {
+                    Text("Check Now").font(.caption.weight(.semibold))
+                }
+            }
+            .disabled(deviceVM.otaStatus.isInProgress || !deviceVM.status.isRecentlyOnline)
+        }
     }
 
     private func infoRow(_ label: String, value: String) -> some View {

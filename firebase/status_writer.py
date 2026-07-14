@@ -2,7 +2,7 @@
 # Writes device status and metadata to Firebase.
 # Updated for multi-zone: includes active_zone_id in status.
 
-import utime
+from core.unix_time import unix_time
 
 
 class StatusWriter:
@@ -44,7 +44,7 @@ class StatusWriter:
             "last_run_zone_id":   last.get("zone_id"),
             "last_run_status":    last.get("status"),
             "device_online":      True,
-            "last_heartbeat":     utime.time(),
+            "last_heartbeat":     unix_time(),
             "active_skip":        active_skip,
             "active_skip_reason": active_skip_reason,
             "firmware_version":   self._version,
@@ -64,7 +64,7 @@ class StatusWriter:
             "current_mode":     "idle",
             "run_started_at":   None,
             "run_ends_at":      None,
-            "last_heartbeat":   utime.time(),
+            "last_heartbeat":   unix_time(),
         }
         if not self._fb.patch("status", data):
             print("Firebase: push_last_run failed (non-fatal)")
@@ -72,6 +72,6 @@ class StatusWriter:
     def push_offline(self):
         self._fb.patch("status", {
             "device_online":  False,
-            "last_heartbeat": utime.time(),
+            "last_heartbeat": unix_time(),
         })
         print("Firebase: device marked offline")

@@ -132,3 +132,6 @@ ios/*.xcodeproj/xcuserdata/
 ios/*.xcworkspace/xcuserdata/
 *.DS_Store
 GoogleService-Info.plist
+
+# Device-written runtime state, not source
+update_status.json
