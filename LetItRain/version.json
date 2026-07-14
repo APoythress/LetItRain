@@ -1,4 +1,0 @@
-{
-  "version": "1.1.0",
-  "notes": "Dual-mode Firebase/local architecture. Firebase status writer, override reader, skip-today support. HTML web UI removed; JSON HTTP API retained for local iOS control."
-}
