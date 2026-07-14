@@ -1,23 +1,23 @@
 {
-  "device_name": "Pico Sprinkler Controller",
-  "relay_pin": 15,
-  "relay_active_high": true,
-  "manual_default_duration_minutes": 10,
+  "device_name": "LetItRain Controller",
+  "zone_count": 1,
+  "zones": [
+    {"id": 1, "name": "Zone 1", "pin": 15, "enabled": true},
+    {"id": 2, "name": "Zone 2", "pin": 14, "enabled": false},
+    {"id": 3, "name": "Zone 3", "pin": 13, "enabled": false},
+    {"id": 4, "name": "Zone 4", "pin": 12, "enabled": false},
+    {"id": 5, "name": "Zone 5", "pin": 11, "enabled": false}
+  ],
   "schedule": {
-    "enabled": false,
-    "days": [
-      0,
-      2,
-      5
-    ],
-    "start_hour": 6,
-    "start_minute": 0,
-    "duration_minutes": 15
+    "monday":    {"enabled": false, "slots": []},
+    "tuesday":   {"enabled": false, "slots": []},
+    "wednesday": {"enabled": false, "slots": []},
+    "thursday":  {"enabled": false, "slots": []},
+    "friday":    {"enabled": false, "slots": []},
+    "saturday":  {"enabled": false, "slots": []},
+    "sunday":    {"enabled": false, "slots": []}
   },
-  "last_run": {
-    "start_epoch": null,
-    "end_epoch": null,
-    "mode": null,
-    "status": null
-  }
+  "manual_default_duration_minutes": 10,
+  "rain_skip_threshold_inches": 0.1,
+  "last_run": {}
 }

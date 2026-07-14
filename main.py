@@ -1,21 +1,17 @@
 # main.py
-# LetItRain Sprinkler Controller — v1.1.0
+# LetItRain v1.2.0 — Multi-zone scheduler
 #
 # Architecture:
-#   - HTTP JSON server (background thread) for local iOS app control
-#   - Firebase Realtime Database writer for remote status visibility
-#   - Firebase override reader for remote "skip today" support
-#   - Existing scheduler and relay logic unchanged
-#
-# Mode summary:
-#   Local  — iOS app talks directly to this HTTP server (full control)
-#   Remote — iOS app reads Firebase status (read-only + skip-today write)
+#   - Multi-zone relay control (up to 5 zones, configurable GPIO pins)
+#   - Multi-slot scheduler: multiple start times per day, per zone
+#   - HTTP JSON API for local iOS control
+#   - Firebase writer: status heartbeat + meta (IP, zone count)
+#   - Firebase reader: schedule + zone config sync every 60s
+#   - Firebase override reader: skip-today support
 
 import utime
 import _thread
 from machine import I2C, Pin
-
-import ntptime
 
 from secrets import (
     WIFI_SSID, WIFI_PASSWORD,
@@ -24,116 +20,111 @@ from secrets import (
     FIRMWARE_VERSION,
 )
 
-from hardware.relay       import RelayController
+from hardware.relay       import ZoneRelayController
 from hardware.ds3231      import DS3231
 from storage.config_store import load_config, save_config
 from core.state           import ControllerState
-from core.scheduler       import should_start_now, should_stop_now
+from core.scheduler       import get_pending_slot, clear_old_slot_runs
 from network.wifi         import connect_wifi
 from firebase.client      import FirebaseClient
 from firebase.status_writer  import StatusWriter
 from firebase.override_reader import OverrideReader
+from firebase.schedule_sync  import ScheduleSync
 from web.server           import run_server
 
 # ---------------------------------------------------------------------------
-# Boot — hardware init
-# relay.off() MUST be the first hardware operation. Do not move it.
+# Boot — load config, init hardware
+# relay.all_off() MUST be the very first hardware operation.
 # ---------------------------------------------------------------------------
 
 config = load_config()
 state  = ControllerState()
 
-relay = RelayController(
-    pin_number=config.get("relay_pin", 15),
+relay = ZoneRelayController(
+    zones_config=config.get("zones", []),
     active_high=config.get("relay_active_high", True),
 )
-relay.off()  # ← SAFETY: ensure relay is off on every boot
+relay.all_off()   # ← SAFETY: de-energise all relays on every boot
 
 i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=100000)
-rtc = DS3231(i2c)
+try:
+    rtc = DS3231(i2c)
+except Exception as ex:
+    print("RTC init failed:", ex)
+    rtc = None
+
+# Tracks which schedule slots have already fired today: {"monday_0": epoch, ...}
+last_run_slots = {}
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Time helpers
 # ---------------------------------------------------------------------------
 
 def get_now_epoch():
-    if rtc is not None:
+    if rtc:
         return rtc.epoch()
     return utime.time()
 
 
-def get_now_iso():
-    if rtc is not None:
-        return rtc.iso_string()
-    t = utime.localtime()
-    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-        t[0], t[1], t[2], t[3], t[4], t[5]
-    )
-
-
 def get_now_date_string():
     """Return today's date as 'YYYY-MM-DD' for skip-date comparisons."""
-    if rtc is not None:
-        iso = rtc.iso_string()          # "YYYY-MM-DD HH:MM:SS"
+    if rtc:
+        iso = rtc.iso_string()
         return iso[:10]
     t = utime.localtime()
     return "{:04d}-{:02d}-{:02d}".format(t[0], t[1], t[2])
 
 
-def sync_rtc_from_ntp():
-    if rtc is None:
-        raise RuntimeError("RTC not initialized")
-    ntptime.settime()
-    t = utime.localtime(utime.time() - 5 * 3600)  # EST offset
-    rtc.set_datetime(t[0], t[1], t[2], t[3], t[4], t[5], t[6] + 1)
-    return rtc.iso_string()
-
-
-def persist_last_run(start_epoch, end_epoch, mode, status):
-    config["last_run"] = {
-        "start_epoch": start_epoch,
-        "end_epoch":   end_epoch,
-        "mode":        mode,
-        "status":      status,
-    }
-    save_config(config)
-
-
 # ---------------------------------------------------------------------------
-# Run control — callbacks used by HTTP server and scheduler
+# Run control
 # ---------------------------------------------------------------------------
 
-def start_run(duration_seconds, mode):
+def start_run(zone_id, duration_seconds, mode):
+    """Start a zone. If another zone is running, stop it first."""
     if state.is_running():
-        return
+        _stop_relay_for_current_zone()
     now_epoch = get_now_epoch()
-    relay.on()
-    state.start_run(now_epoch, duration_seconds, mode)
-    print("Run started:", mode, "for", duration_seconds, "s at", get_now_iso())
+    relay.on(zone_id)
+    state.start_run(now_epoch, duration_seconds, mode, zone_id)
+    print("Run started: zone={} mode={} duration={}s".format(zone_id, mode, duration_seconds))
+
+
+def _stop_relay_for_current_zone():
+    if state.current_zone_id:
+        relay.off(state.current_zone_id)
 
 
 def stop_run(status_str="completed"):
     if not state.is_running():
-        relay.off()
+        relay.all_off()
         return
     start_epoch = state.current_run_start_epoch
     mode        = state.current_run_mode
+    zone_id     = state.current_zone_id
     end_epoch   = get_now_epoch()
-    relay.off()
-    state.stop_run()
-    persist_last_run(start_epoch, end_epoch, mode, status_str)
-    print("Run stopped:", status_str, "at", get_now_iso())
 
-    # Immediately push last-run to Firebase (best-effort)
+    _stop_relay_for_current_zone()
+    state.stop_run()
+
+    config["last_run"] = {
+        "start_epoch": start_epoch,
+        "end_epoch":   end_epoch,
+        "mode":        mode,
+        "zone_id":     zone_id,
+        "status":      status_str,
+    }
+    save_config(config)
+    print("Run stopped: zone={} status={}".format(zone_id, status_str))
+
     try:
-        status_writer.push_last_run(start_epoch, end_epoch, mode, status_str)
+        status_writer.push_last_run(start_epoch, end_epoch, mode, zone_id, status_str)
     except Exception as ex:
         print("Firebase push_last_run failed (non-fatal):", ex)
 
 
-def on_manual_start(duration_minutes=None):
+def on_manual_start(zone_id=1, duration_minutes=None):
     mins = duration_minutes or config.get("manual_default_duration_minutes", 10)
-    start_run(int(mins) * 60, "manual")
+    start_run(int(zone_id), int(mins) * 60, "manual")
 
 
 def on_manual_stop():
@@ -141,13 +132,10 @@ def on_manual_stop():
 
 
 # ---------------------------------------------------------------------------
-# Local override state — shared mutable dict between HTTP thread and main loop
+# Local override state (shared with HTTP thread)
 # ---------------------------------------------------------------------------
 
-local_override = {
-    "skip_today":  False,
-    "skip_reason": None,
-}
+local_override = {"skip_today": False, "skip_reason": None}
 
 # ---------------------------------------------------------------------------
 # HTTP server thread
@@ -161,80 +149,76 @@ def start_web_server():
             rtc=rtc,
             on_manual_start=on_manual_start,
             on_manual_stop=on_manual_stop,
-            sync_rtc_from_ntp=sync_rtc_from_ntp,
             local_override=local_override,
             save_config_fn=save_config,
         )
     except Exception as ex:
-        print("HTTP server thread error:", ex)
+        print("HTTP server thread crashed:", ex)
+
+
+# ---------------------------------------------------------------------------
+# Module-level reference so stop_run() can call status_writer
+# ---------------------------------------------------------------------------
+
+status_writer   = None
+override_reader = None
+schedule_sync   = None
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-# Declare at module level so stop_run() can reference status_writer
-status_writer = None
-
-
 def main():
-    global status_writer
+    global status_writer, override_reader, schedule_sync
 
     print("LetItRain v{} booting...".format(FIRMWARE_VERSION))
+    print("Zones configured:", relay.zone_ids())
 
-    # -----------------------------------------------------------------------
-    # Wi-Fi
-    # -----------------------------------------------------------------------
+    # --- Wi-Fi ---
     local_ip = "0.0.0.0"
     try:
         wlan     = connect_wifi(WIFI_SSID, WIFI_PASSWORD)
         local_ip = wlan.ifconfig()[0]
     except Exception as ex:
-        print("Wi-Fi failed:", ex)
-        # Scheduler still runs offline; Firebase features disabled
+        print("Wi-Fi failed (non-fatal, running offline):", ex)
 
-    # -----------------------------------------------------------------------
-    # Firebase init
-    # -----------------------------------------------------------------------
+    # --- Firebase ---
     fb = FirebaseClient(
-        api_key=FIREBASE_API_KEY,
-        email=FIREBASE_EMAIL,
-        password=FIREBASE_PASSWORD,
-        db_url=FIREBASE_DB_URL,
+        api_key=FIREBASE_API_KEY, email=FIREBASE_EMAIL,
+        password=FIREBASE_PASSWORD, db_url=FIREBASE_DB_URL,
         device_id=FIREBASE_DEVICE_ID,
     )
-
     firebase_ok = False
     try:
         firebase_ok = fb.authenticate()
     except Exception as ex:
         print("Firebase auth failed (non-fatal):", ex)
 
-    status_writer   = StatusWriter(
-        fb, state, config, FIRMWARE_VERSION,
-        config.get("device_name", "Pico Sprinkler Controller"),
-    )
+    status_writer   = StatusWriter(fb, state, config, FIRMWARE_VERSION,
+                                   config.get("device_name", "LetItRain Controller"))
     override_reader = OverrideReader(fb)
+    schedule_sync   = ScheduleSync(fb, config, save_config)
 
     if firebase_ok:
         try:
+            schedule_sync.push_initial()   # seed Firebase if empty
+            schedule_sync.sync()           # pull latest schedule/zones
             status_writer.push_ip(local_ip)
         except Exception as ex:
-            print("Firebase push_ip failed (non-fatal):", ex)
+            print("Firebase boot sync failed (non-fatal):", ex)
 
-    # -----------------------------------------------------------------------
-    # HTTP server in background thread
-    # -----------------------------------------------------------------------
+    # --- HTTP server thread ---
     try:
         _thread.start_new_thread(start_web_server, ())
     except Exception as ex:
-        print("HTTP server thread failed to start:", ex)
+        print("HTTP thread start failed:", ex)
 
-    # -----------------------------------------------------------------------
-    # Timing trackers for main loop
-    # -----------------------------------------------------------------------
-    last_status_push = 0   # push Firebase status every 15s
-    STATUS_INTERVAL  = 15
+    # --- Timing ---
+    last_status_push  = 0
+    last_schedule_sync = 0
+    STATUS_INTERVAL   = 15
+    SYNC_INTERVAL     = 60
 
     print("Main loop started.")
 
@@ -244,54 +228,44 @@ def main():
                 now_epoch       = get_now_epoch()
                 now_date_string = get_now_date_string()
 
-                # -----------------------------------------------------------
-                # Scheduler
-                # -----------------------------------------------------------
-                schedule        = config.get("schedule", {})
-                last_run_start  = config.get("last_run", {}).get("start_epoch")
-
-                if should_start_now(schedule, now_epoch, state, last_run_start):
-                    # Check local in-memory override first (fastest, no network call)
-                    skip_active = local_override["skip_today"]
-                    skip_reason = local_override["skip_reason"]
-
-                    # Only query Firebase if local override is not set
-                    if not skip_active:
-                        try:
-                            skip_active, skip_reason = override_reader.get_active_skip(
-                                now_date_string
-                            )
-                        except Exception as ex:
-                            print("Override reader error (fail open):", ex)
-                            skip_active = False
-                            skip_reason = None
-
-                    if skip_active:
-                        print("Scheduled run skipped — reason:", skip_reason)
-                        # Echo skip into Firebase status
-                        # -----------------------------------------------
-                        # FUTURE v1.2 — Rain threshold check slot:
-                        # Read rain_inches from override_reader result and
-                        # compare to config["rain_skip_threshold_inches"].
-                        # If below threshold, clear skip_active and proceed.
-                        # -----------------------------------------------
-                        try:
-                            status_writer.push_status(
-                                active_skip=True,
-                                active_skip_reason=skip_reason,
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        duration_seconds = schedule.get("duration_minutes", 10) * 60
-                        start_run(duration_seconds, "scheduled")
-
-                if should_stop_now(now_epoch, state):
+                # --- Stop check ---
+                if state.should_stop_now(now_epoch):
                     stop_run("completed")
 
-                # -----------------------------------------------------------
-                # Firebase heartbeat
-                # -----------------------------------------------------------
+                # --- Scheduler ---
+                if not state.is_running():
+                    clear_old_slot_runs(last_run_slots, now_epoch)
+
+                    slot, slot_key = get_pending_slot(
+                        config.get("schedule", {}),
+                        state,
+                        last_run_slots,
+                        now_epoch,
+                    )
+
+                    if slot and slot_key:
+                        # Check skip override
+                        skip_active = local_override["skip_today"]
+                        skip_reason = local_override["skip_reason"]
+                        if not skip_active:
+                            try:
+                                skip_active, skip_reason = override_reader.get_active_skip(
+                                    now_date_string)
+                            except Exception as ex:
+                                print("Override read error (fail open):", ex)
+                                skip_active = False
+
+                        if skip_active:
+                            print("Scheduled slot skipped:", slot_key, "reason:", skip_reason)
+                            last_run_slots[slot_key] = now_epoch  # mark as handled
+                            # FUTURE v1.2: rain_inches threshold check here
+                        else:
+                            zone_id          = slot.get("zone", 1)
+                            duration_seconds = slot.get("duration_minutes", 10) * 60
+                            start_run(zone_id, duration_seconds, "scheduled")
+                            last_run_slots[slot_key] = now_epoch
+
+                # --- Firebase heartbeat ---
                 if utime.time() - last_status_push >= STATUS_INTERVAL:
                     try:
                         status_writer.push_status(
@@ -302,14 +276,24 @@ def main():
                         print("Firebase heartbeat failed (non-fatal):", ex)
                     last_status_push = utime.time()
 
+                # --- Schedule sync ---
+                if utime.time() - last_schedule_sync >= SYNC_INTERVAL:
+                    try:
+                        schedule_sync.sync()
+                        # If zones changed, re-init relay controller would need reboot
+                        # For now: log a note; zone hardware changes require reboot
+                    except Exception as ex:
+                        print("Schedule sync failed (non-fatal):", ex)
+                    last_schedule_sync = utime.time()
+
             except Exception as ex:
                 print("Main loop error:", ex)
-                relay.off()
+                relay.all_off()
 
             utime.sleep(5)
 
     finally:
-        # Best-effort offline marker on clean shutdown
+        relay.all_off()
         try:
             status_writer.push_offline()
         except Exception:

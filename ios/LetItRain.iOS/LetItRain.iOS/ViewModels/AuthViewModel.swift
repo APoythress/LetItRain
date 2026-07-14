@@ -3,6 +3,7 @@
 // This is a private app — no sign-up flow, only sign-in.
 
 import Foundation
+import Combine
 import FirebaseAuth
 
 @MainActor

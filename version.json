@@ -1,4 +1,4 @@
 {
-  "version": "1.1.0",
-  "notes": "Dual-mode Firebase/local architecture. Firebase status writer, override reader, skip-today support. HTML web UI removed; JSON HTTP API retained for local iOS control."
+  "version": "1.2.0",
+  "notes": "Multi-zone scheduler. Up to 5 zones with individual GPIO pin mapping. Multiple time slots per day per zone. Auto-builder in iOS app. Firebase schedule/zone sync (read + write). IFTTT rain hook stub retained."
 }
