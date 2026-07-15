@@ -6,5 +6,12 @@
 	<array>
 		<string>remote-notification</string>
 	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>LetItRain connects directly to your sprinkler controller over your home Wi-Fi for faster, more reliable local control.</string>
 </dict>
 </plist>

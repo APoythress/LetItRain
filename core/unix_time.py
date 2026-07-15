@@ -1,19 +1,19 @@
 # core/unix_time.py
-# MicroPython's utime epoch on this port is 2000-01-01, not 1970-01-01
-# like Unix/the iOS app's Date(timeIntervalSince1970:). Any timestamp
-# handed to Firebase/the app must be converted, or "last seen" and run
-# timestamps will be off by ~30 years and read as permanently stale.
+# On this board's MicroPython build (v1.25.0, rp2), utime.time() already
+# returns real Unix (1970-01-01) seconds once ntptime.settime() has run at
+# boot -- confirmed empirically (a 2000-epoch offset here overshot the app's
+# Date(timeIntervalSince1970:) math by ~30 years). Kept as a named module
+# rather than calling utime.time() directly everywhere, so if a future board
+# or firmware build needs a real conversion, there's one place to add it.
 
 import utime
-
-_UNIX_EPOCH_OFFSET = 946684800  # seconds between 1970-01-01 and 2000-01-01
 
 
 def unix_time():
     """Current time as real Unix seconds (for Firebase/app-facing timestamps)."""
-    return utime.time() + _UNIX_EPOCH_OFFSET
+    return utime.time()
 
 
 def to_unix(mp_epoch):
-    """Convert a MicroPython-epoch value (e.g. from DS3231.epoch()) to Unix seconds."""
-    return mp_epoch + _UNIX_EPOCH_OFFSET
+    """Pass-through today; kept for symmetry with unix_time() and DS3231.epoch()."""
+    return mp_epoch
