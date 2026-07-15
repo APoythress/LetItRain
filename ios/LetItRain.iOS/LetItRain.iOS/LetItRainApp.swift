@@ -18,7 +18,7 @@ struct LetItRainApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(connectionManager: connectionManager)
                 .environmentObject(authVM)
                 .environmentObject(connectionManager)
         }

@@ -68,6 +68,7 @@ class FirebaseClient:
             "password":          self._password,
             "returnSecureToken": True,
         })
+        resp = None
         try:
             resp = requests.post(
                 url,
@@ -76,7 +77,6 @@ class FirebaseClient:
                 timeout=_REQUEST_TIMEOUT,
             )
             data = resp.json()
-            resp.close()
 
             if "idToken" in data:
                 self._id_token     = data["idToken"]
@@ -90,6 +90,13 @@ class FirebaseClient:
         except Exception as ex:
             print("Firebase: authenticate exception:", ex)
             return False
+        finally:
+            # Guarantee the socket is released even if resp.json() raises on
+            # a malformed/truncated body -- otherwise it leaks and the fixed
+            # lwIP socket pool eventually runs out (ENOMEM on some later,
+            # unrelated request).
+            if resp is not None:
+                resp.close()
 
     def _refresh_if_needed(self):
         """Re-authenticate if the token is within 5 minutes of expiry (3600s)."""
@@ -122,19 +129,20 @@ class FirebaseClient:
             Fails silently — callers must handle None.
         """
         self._refresh_if_needed()
+        resp = None
         try:
             resp = requests.get(self._url(path), timeout=_REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 print("Firebase: get({}) status {} body {}".format(
                     path, resp.status_code, resp.text))
-                resp.close()
                 return None
-            data = resp.json()
-            resp.close()
-            return data
+            return resp.json()
         except Exception as ex:
             print("Firebase: get({}) exception: {}".format(path, ex))
             return None
+        finally:
+            if resp is not None:
+                resp.close()
 
     def patch(self, path, data_dict):
         """
@@ -148,6 +156,7 @@ class FirebaseClient:
             True on HTTP 200, False on any error.
         """
         self._refresh_if_needed()
+        resp = None
         try:
             resp = requests.patch(
                 self._url(path),
@@ -159,11 +168,13 @@ class FirebaseClient:
             if not ok:
                 print("Firebase: patch({}) status {} body {}".format(
                     path, resp.status_code, resp.text))
-            resp.close()
             return ok
         except Exception as ex:
             print("Firebase: patch({}) exception: {}".format(path, ex))
             return False
+        finally:
+            if resp is not None:
+                resp.close()
 
     def put(self, path, value):
         """
@@ -177,6 +188,7 @@ class FirebaseClient:
             True on HTTP 200, False on any error.
         """
         self._refresh_if_needed()
+        resp = None
         try:
             resp = requests.put(
                 self._url(path),
@@ -184,9 +196,10 @@ class FirebaseClient:
                 headers={"Content-Type": "application/json"},
                 timeout=_REQUEST_TIMEOUT,
             )
-            ok = resp.status_code == 200
-            resp.close()
-            return ok
+            return resp.status_code == 200
         except Exception as ex:
             print("Firebase: put({}) exception: {}".format(path, ex))
             return False
+        finally:
+            if resp is not None:
+                resp.close()

@@ -17,6 +17,7 @@
 
 import ujson
 import os
+import gc
 
 try:
     import urequests as requests
@@ -27,6 +28,8 @@ LOCAL_VERSION_FILE = "version.json"
 UPDATE_STATUS_FILE = "update_status.json"
 MANIFEST_PATH       = "ota/manifest.json"
 _REQUEST_TIMEOUT    = 15  # firmware files are small, but allow more than RTDB's 8s
+_DOWNLOAD_CHUNK_SIZE = 512  # read/write in small pieces so we never need one
+                             # big contiguous allocation for the whole file
 
 
 def _storage_url(bucket, object_path):
@@ -103,11 +106,22 @@ def _download_file(bucket, id_token, object_path, local_path):
         resp.close()
         raise RuntimeError("download {} failed: {} {}".format(
             object_path, resp.status_code, body))
-    content = resp.content
-    resp.close()
     _ensure_parent_dirs(local_path)
-    with open(local_path, "wb") as f:
-        f.write(content)
+    try:
+        # Stream straight to disk in small pieces instead of resp.content,
+        # which buffers the whole file as one contiguous bytes object and
+        # blows up with "memory allocation failed" once the heap is
+        # fragmented (Wi-Fi buffers, HTTP server thread, relay/RTC objects
+        # all share the same ~264KB SRAM).
+        with open(local_path, "wb") as f:
+            while True:
+                chunk = resp.raw.read(_DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+                gc.collect()
+    finally:
+        resp.close()
 
 
 def check_for_update(bucket, id_token):
@@ -121,17 +135,18 @@ def check_for_update(bucket, id_token):
     Returns True if a new version was downloaded (caller should reset once
     safe), False if already up to date or the check failed.
     """
+    resp = None
     try:
         _set_status("checking", "Checking for update...")
         resp = _get(bucket, id_token, MANIFEST_PATH)
         if resp.status_code != 200:
-            body = resp.text
-            resp.close()
+            status_code = resp.status_code
             _set_status("error", "manifest fetch failed: {} {}".format(
-                resp.status_code, body))
+                status_code, resp.text))
             return False
         manifest = resp.json()
         resp.close()
+        resp = None
 
         remote_version = manifest.get("version", "0.0.0")
         local_version  = get_local_version()
@@ -159,3 +174,6 @@ def check_for_update(bucket, id_token):
     except Exception as ex:
         _set_status("error", str(ex))
         return False
+    finally:
+        if resp is not None:
+            resp.close()

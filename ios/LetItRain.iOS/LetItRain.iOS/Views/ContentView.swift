@@ -11,12 +11,14 @@ struct ContentView: View {
     @StateObject private var firebaseRepo = FirebaseRepository()
     @StateObject private var deviceVM:      DeviceViewModel
 
-    init() {
-        // DeviceViewModel needs both dependencies. We create them here so
-        // they share the same instances throughout the app.
+    init(connectionManager: ConnectionManager) {
+        // DeviceViewModel needs both dependencies. We create the repo here and
+        // reuse the app-wide ConnectionManager (injected from LetItRainApp) so
+        // there's only one instance — the same one that gets `metaProvider`
+        // wired up below and that HomeView/DashboardView read via
+        // @EnvironmentObject.
         let repo = FirebaseRepository()
-        let cm   = ConnectionManager()
-        _deviceVM      = StateObject(wrappedValue: DeviceViewModel(connectionManager: cm, firebaseRepository: repo))
+        _deviceVM      = StateObject(wrappedValue: DeviceViewModel(connectionManager: connectionManager, firebaseRepository: repo))
         _firebaseRepo  = StateObject(wrappedValue: repo)
     }
 

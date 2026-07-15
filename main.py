@@ -17,7 +17,6 @@ from secrets import (
     WIFI_SSID, WIFI_PASSWORD,
     FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD,
     FIREBASE_DB_URL, FIREBASE_DEVICE_ID, FIREBASE_STORAGE_BUCKET,
-    FIRMWARE_VERSION,
 )
 
 from netcfg.wifi import connect_wifi
@@ -35,7 +34,7 @@ from firebase.status_writer  import StatusWriter
 from firebase.override_reader import OverrideReader
 from firebase.schedule_sync  import ScheduleSync
 from web.server           import run_server
-from update.updater       import check_for_update, get_status as get_ota_status
+from update.updater       import check_for_update, get_status as get_ota_status, get_local_version
 
 # ---------------------------------------------------------------------------
 # Boot — load config, init hardware
@@ -173,7 +172,7 @@ def start_web_server():
             local_override=local_override,
             save_config_fn=save_config,
             now_fn=get_now_epoch,
-            firmware_version=FIRMWARE_VERSION,
+            firmware_version=firmware_version,
         )
     except Exception as ex:
         print("HTTP server thread crashed:", ex)
@@ -183,9 +182,10 @@ def start_web_server():
 # Module-level reference so stop_run() can call status_writer
 # ---------------------------------------------------------------------------
 
-status_writer   = None
-override_reader = None
-schedule_sync   = None
+status_writer    = None
+override_reader  = None
+schedule_sync    = None
+firmware_version = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +193,19 @@ schedule_sync   = None
 # ---------------------------------------------------------------------------
 
 def main():
-    global status_writer, override_reader, schedule_sync
+    global status_writer, override_reader, schedule_sync, firmware_version
 
-    print("LetItRain v{} booting...".format(FIRMWARE_VERSION))
+    # Single source of truth for the running version: whatever the OTA
+    # updater last wrote to version.json. This keeps the displayed version
+    # in sync automatically after every successful update, with no separate
+    # constant to remember to bump.
+    firmware_version = get_local_version()
+
+    print("LetItRain v{} booting...".format(firmware_version))
     print("Zones configured:", relay.zone_ids())
 
     # --- Wi-Fi ---
+    wlan     = None
     local_ip = "0.0.0.0"
     try:
         wlan = connect_wifi(WIFI_SSID, WIFI_PASSWORD, on_wait=status_led.tick)
@@ -229,7 +236,7 @@ def main():
     except Exception as ex:
         print("Firebase auth failed (non-fatal):", ex)
 
-    status_writer   = StatusWriter(fb, state, config, FIRMWARE_VERSION,
+    status_writer   = StatusWriter(fb, state, config, firmware_version,
                                    config.get("device_name", "LetItRain Controller"))
     override_reader = OverrideReader(fb)
     schedule_sync   = ScheduleSync(fb, config, save_config)
@@ -240,11 +247,18 @@ def main():
         try:
             schedule_sync.push_initial()   # seed Firebase if empty
             schedule_sync.sync()           # pull latest schedule/zones
-            status_writer.push_ip(local_ip)
             status_led.set_mode("running")
         except Exception as ex:
             print("Firebase boot sync failed (non-fatal):", ex)
             status_led.set_mode("no_internet")
+
+        # Pushed in its own try block: the app relies on meta/local_ip to know
+        # which IP to probe for local mode, so a schedule-sync failure above
+        # must never prevent this from being written.
+        try:
+            status_writer.push_ip(local_ip)
+        except Exception as ex:
+            print("Firebase push_ip failed (non-fatal):", ex)
 
         try:
             update_pending = check_for_update(FIREBASE_STORAGE_BUCKET, fb.id_token)
@@ -262,9 +276,11 @@ def main():
     # --- Timing ---
     last_status_push  = 0
     last_schedule_sync = 0
+    last_ip_push       = utime.time()
     last_update_check  = utime.time()
     STATUS_INTERVAL   = 15
     SYNC_INTERVAL     = 60
+    IP_PUSH_INTERVAL  = 300  # re-check/re-push local_ip every 5 min
     UPDATE_CHECK_INTERVAL = 21600  # 6 hours
 
     print("Main loop started.")
@@ -341,6 +357,21 @@ def main():
                         pass
 
                     last_status_push = utime.time()
+
+                # --- Local IP re-check ---
+                # Catches DHCP lease renewals / router reboots that hand the
+                # Pico a new address after boot, so meta/local_ip in Firebase
+                # never goes stale for longer than IP_PUSH_INTERVAL.
+                if utime.time() - last_ip_push >= IP_PUSH_INTERVAL:
+                    if wlan is not None and wlan.isconnected():
+                        try:
+                            current_ip = wlan.ifconfig()[0]
+                            if current_ip != local_ip:
+                                local_ip = current_ip
+                            status_writer.push_ip(local_ip)
+                        except Exception as ex:
+                            print("Firebase push_ip failed (non-fatal):", ex)
+                    last_ip_push = utime.time()
 
                 # --- Schedule sync ---
                 if utime.time() - last_schedule_sync >= SYNC_INTERVAL:
