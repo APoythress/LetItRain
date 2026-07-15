@@ -432,20 +432,16 @@ struct ZoneEditorSheet: View {
                                 get: { zone.enabled },
                                 set: { zone.enabled = $0; vm.hasUnsavedChanges = true }
                             )) {
-                                Text("Zone \(zone.id)").font(.headline).foregroundColor(.white)
+                                
+                                TextField("e.g. Front Lawn", text: Binding(
+                                    get: { zone.name },
+                                    set: { zone.name = $0; vm.hasUnsavedChanges = true }
+                                )).font(.title2).foregroundColor(.white.opacity(0.5))
                             }
                             .tint(Color(hex: "42A5F5"))
 
                             if zone.enabled {
-                                HStack {
-                                    Text("Name").font(.caption).foregroundColor(.white.opacity(0.5))
-                                    Spacer()
-                                    TextField("e.g. Front Lawn", text: Binding(
-                                        get: { zone.name },
-                                        set: { zone.name = $0; vm.hasUnsavedChanges = true }
-                                    ))
-                                    .foregroundColor(.white).multilineTextAlignment(.trailing)
-                                }
+                                Spacer()
 
                                 HStack {
                                     Text("GPIO Pin").font(.caption).foregroundColor(.white.opacity(0.5))
