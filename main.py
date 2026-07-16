@@ -80,17 +80,26 @@ last_run_slots = {}
 # ---------------------------------------------------------------------------
 
 def get_now_epoch():
+    """True UTC epoch — used for Firebase timestamps, run-duration math, and
+    anything the app compares against Date().timeIntervalSince1970. The
+    DS3231 (when present) is kept synced to UTC via NTP at boot, so both
+    branches below return the same true-UTC convention."""
     if rtc:
         return to_unix(rtc.epoch())
     return unix_time()
 
 
+def get_local_wall_clock_epoch():
+    """Epoch-shaped value representing LOCAL wall-clock time — for schedule
+    matching and "today's date" only. MicroPython has no timezone database,
+    so this is a fixed manual offset (-5 = EST TODO: Make this config driven in app, no
+    DST). Never send this to Firebase/the app — it is not a real timestamp."""
+    return get_now_epoch() + (-5 * 3600)
+
+
 def get_now_date_string():
-    """Return today's date as 'YYYY-MM-DD' for skip-date comparisons."""
-    if rtc:
-        iso = rtc.iso_string()
-        return iso[:10]
-    t = utime.localtime()
+    """Return today's LOCAL date as 'YYYY-MM-DD' for skip-date comparisons."""
+    t = utime.localtime(get_local_wall_clock_epoch())
     return "{:04d}-{:02d}-{:02d}".format(t[0], t[1], t[2])
 
 
@@ -221,6 +230,15 @@ def main():
         import ntptime
         ntptime.settime()
         print("NTP: time synced")
+
+        # Keep the DS3231 in true UTC too, so it agrees with unix_time()
+        # whenever Wi-Fi is down and get_now_epoch() falls back to it. This
+        # replaces manually running set_rtc_once.py -- and fixes it if that
+        # script was ever run with the wrong value.
+        if rtc is not None:
+            t = utime.localtime(unix_time())  # UTC fields, no offset applied
+            rtc.set_datetime(t[0], t[1], t[2], t[3], t[4], t[5], t[6] + 1)
+            print("RTC: synced from NTP to", rtc.iso_string())
     except Exception as ex:
         print("NTP: sync failed (non-fatal):", ex)
 
@@ -278,17 +296,20 @@ def main():
     last_schedule_sync = 0
     last_ip_push       = utime.time()
     last_update_check  = utime.time()
+    last_ota_poll      = utime.time()
     STATUS_INTERVAL   = 15
     SYNC_INTERVAL     = 60
     IP_PUSH_INTERVAL  = 300  # re-check/re-push local_ip every 5 min
     UPDATE_CHECK_INTERVAL = 21600  # 6 hours
+    OTA_POLL_INTERVAL = 30   # manual "check now" trigger + status push
 
     print("Main loop started.")
 
     try:
         while True:
             try:
-                now_epoch       = get_now_epoch()
+                now_epoch       = get_now_epoch()             # true UTC — run/Firebase math
+                local_epoch     = get_local_wall_clock_epoch()  # local wall clock — scheduling only
                 now_date_string = get_now_date_string()
 
                 # --- Stop check ---
@@ -297,13 +318,13 @@ def main():
 
                 # --- Scheduler ---
                 if not state.is_running():
-                    clear_old_slot_runs(last_run_slots, now_epoch)
+                    clear_old_slot_runs(last_run_slots, local_epoch)
 
                     slot, slot_key = get_pending_slot(
                         config.get("schedule", {}),
                         state,
                         last_run_slots,
-                        now_epoch,
+                        local_epoch,
                     )
 
                     if slot and slot_key:
@@ -320,15 +341,19 @@ def main():
 
                         if skip_active:
                             print("Scheduled slot skipped:", slot_key, "reason:", skip_reason)
-                            last_run_slots[slot_key] = now_epoch  # mark as handled
+                            last_run_slots[slot_key] = local_epoch  # mark as handled
                             # FUTURE v1.2: rain_inches threshold check here
                         else:
                             zone_id          = slot.get("zone", 1)
                             duration_seconds = slot.get("duration_minutes", 10) * 60
                             start_run(zone_id, duration_seconds, "scheduled")
-                            last_run_slots[slot_key] = now_epoch
+                            last_run_slots[slot_key] = local_epoch
 
                 # --- Firebase heartbeat ---
+                # Kept to a single request: the app's "device online" check is
+                # a tight ~30s freshness window, and this loop is single-
+                # threaded, so anything else stacked here directly delays how
+                # often this specific call can land.
                 if utime.time() - last_status_push >= STATUS_INTERVAL:
                     try:
                         status_writer.push_status(
@@ -339,8 +364,13 @@ def main():
                     except Exception as ex:
                         print("Firebase heartbeat failed (non-fatal):", ex)
                         status_led.set_mode("no_internet")
+                    last_status_push = utime.time()
 
-                    # Manual OTA trigger from the app: devices/{id}/update/requested
+                # --- Manual OTA trigger + status push ---
+                # Own interval, separate from the heartbeat above, so a
+                # pending "check now" from the app doesn't add extra
+                # round-trips to the time-sensitive online/offline signal.
+                if utime.time() - last_ota_poll >= OTA_POLL_INTERVAL:
                     if not update_pending and fb.id_token:
                         try:
                             update_info = fb.get("update") or {}
@@ -350,13 +380,12 @@ def main():
                         except Exception as ex:
                             print("OTA trigger check failed (non-fatal):", ex)
 
-                    # Publish current OTA status so the app can show progress
                     try:
                         fb.patch("update", get_ota_status())
                     except Exception:
                         pass
 
-                    last_status_push = utime.time()
+                    last_ota_poll = utime.time()
 
                 # --- Local IP re-check ---
                 # Catches DHCP lease renewals / router reboots that hand the

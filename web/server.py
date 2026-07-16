@@ -30,6 +30,49 @@ def _json_response(conn, status_code, data_dict):
         conn.close()
 
 
+def _read_request(conn, max_bytes=65536):
+    """
+    Read a full HTTP request, looping recv() until the header block AND the
+    full Content-Length body have arrived.
+
+    A single recv() call can return only the headers if the client sends
+    headers and body as separate TCP writes (common for POST requests over
+    Wi-Fi) -- this was silently truncating request bodies (e.g. a manual
+    start's duration_minutes), leaving _parse_request() with an empty body
+    and falling back to defaults with no visible error.
+    """
+    conn.settimeout(5)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return data
+        data += chunk
+        if len(data) > max_bytes:
+            return data
+
+    header_end = data.find(b"\r\n\r\n")
+    header_text = data[:header_end].decode("utf-8", "ignore")
+    content_length = 0
+    for line in header_text.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            try:
+                content_length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                content_length = 0
+            break
+
+    body_so_far = len(data) - (header_end + 4)
+    while body_so_far < content_length and len(data) < max_bytes:
+        chunk = conn.recv(1024)
+        if not chunk:
+            break
+        data += chunk
+        body_so_far += len(chunk)
+
+    return data
+
+
 def _parse_request(raw):
     try:
         text   = raw.decode("utf-8", "ignore")
@@ -62,7 +105,7 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
     while True:
         try:
             conn, client_addr = server.accept()
-            raw = conn.recv(4096)
+            raw = _read_request(conn)
             method, path, body = _parse_request(raw)
             print("HTTP {} {} from {}".format(method, path, client_addr))
 

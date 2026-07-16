@@ -134,7 +134,10 @@ FIREBASE_PASSWORD   = "your-40-char-pico-account-password"
 FIREBASE_DB_URL     = "https://letitrain-default-rtdb.firebaseio.com"
 FIREBASE_DEVICE_ID  = "pico-zone-1"
 FIREBASE_STORAGE_BUCKET = "your-project-id.appspot.com"   ← see OTA Updates section below
+UTC_OFFSET_HOURS    = -5   ← your timezone's STANDARD offset from UTC, e.g. -5 for US Eastern, -6 Central, -7 Mountain, -8 Pacific
 ```
+
+`UTC_OFFSET_HOURS` is used only for matching your schedule's local start times and determining "today" for skip-day — it does not affect Firebase timestamps, which are always true UTC. MicroPython has no timezone/DST database, so this is a fixed manual number: pick standard time (not daylight saving) and expect scheduled runs to drift by an hour during DST, or update the value twice a year if you want to track it exactly.
 
 ### 2. Flash Files to Pico
 Copy all `.py` files and folders to the Pico (using Thonny or rshell):

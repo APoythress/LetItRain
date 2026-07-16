@@ -1,8 +1,8 @@
 {
-  "version": "1.2.4",
+  "version": "1.2.5",
   "files": [
     { "path": "main.py" },
-    { "path": "update/updater.py" },
-    { "path": "firebase/client.py" }
+    { "path": "set_rtc_once.py" },
+    { "path": "web/server.py" }
   ]
 }
