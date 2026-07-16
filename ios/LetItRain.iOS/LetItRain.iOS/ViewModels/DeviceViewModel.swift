@@ -29,10 +29,22 @@ final class DeviceViewModel: ObservableObject {
         observeFirebaseStatus()
         observeFirebaseConfig()
         observeFirebaseOTAStatus()
+        observeMetaAvailability()
         wireScheduleVM()
     }
 
     // MARK: - Observation
+
+    private func observeMetaAvailability() {
+        // The connection manager's periodic timer alone can leave the app
+        // showing "Remote" for up to 30s after launch, since on a cold start
+        // the Pico's local IP usually hasn't arrived from Firebase yet when
+        // the first evaluation runs. Re-evaluate the moment it does.
+        firebaseRepository.$meta
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.connectionManager.evaluate(reason: "meta updated") }
+            .store(in: &cancellables)
+    }
 
     private func observeModeChanges() {
         connectionManager.$mode
@@ -124,7 +136,7 @@ final class DeviceViewModel: ObservableObject {
                 scheduleVM.load(from: newConfig)
             }
         } catch {
-            connectionManager.evaluate()
+            connectionManager.evaluate(reason: "local poll failed")
         }
     }
 

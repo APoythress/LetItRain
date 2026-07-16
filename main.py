@@ -219,6 +219,15 @@ def main():
     try:
         wlan = connect_wifi(WIFI_SSID, WIFI_PASSWORD, on_wait=status_led.tick)
         local_ip = wlan.ifconfig()[0]
+        if local_ip == "0.0.0.0":
+            # wlan.isconnected() can flip true a beat before the DHCP lease
+            # is actually reflected in ifconfig() — give it a moment rather
+            # than pushing the placeholder IP the app treats as invalid.
+            for _ in range(10):
+                utime.sleep_ms(200)
+                local_ip = wlan.ifconfig()[0]
+                if local_ip != "0.0.0.0":
+                    break
     except Exception as ex:
         print("Wi-Fi failed (non-fatal, running offline):", ex)
 
@@ -395,9 +404,15 @@ def main():
                     if wlan is not None and wlan.isconnected():
                         try:
                             current_ip = wlan.ifconfig()[0]
-                            if current_ip != local_ip:
+                            # Never adopt/push "0.0.0.0" — ifconfig() can read
+                            # that transiently during a DHCP lease renewal,
+                            # and pushing it would overwrite a known-good IP
+                            # in Firebase with a value the app treats as
+                            # invalid until the next 5-minute cycle.
+                            if current_ip != "0.0.0.0" and current_ip != local_ip:
                                 local_ip = current_ip
-                            status_writer.push_ip(local_ip)
+                            if local_ip != "0.0.0.0":
+                                status_writer.push_ip(local_ip)
                         except Exception as ex:
                             print("Firebase push_ip failed (non-fatal):", ex)
                     last_ip_push = utime.time()

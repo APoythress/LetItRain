@@ -76,7 +76,7 @@ struct DashboardView: View {
 
     private var offlineBanner: some View {
         HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.wifi").foregroundColor(Color(hex: "FF6B6B"))
+            Image(systemName: "wifi.slash").foregroundColor(Color(hex: "FF6B6B"))
             VStack(alignment: .leading, spacing: 2) {
                 Text("Device Offline").font(.footnote.weight(.semibold)).foregroundColor(Color(hex: "FF6B6B"))
                 Text(lastSeenText).font(.caption2).foregroundColor(.white.opacity(0.5))

@@ -34,7 +34,7 @@ struct ContentView: View {
                             await firebaseRepo?.currentMeta()
                         }
                         firebaseRepo.startListening()
-                        connectionManager.evaluate()
+                        connectionManager.evaluate(reason: "app launch")
                     }
             } else {
                 LoginView()

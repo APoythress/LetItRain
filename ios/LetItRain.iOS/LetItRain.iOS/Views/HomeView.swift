@@ -12,6 +12,7 @@ struct HomeView: View {
     @EnvironmentObject var deviceVM:          DeviceViewModel
 
     @State private var selectedTab = 0
+    @State private var showDiagnostics = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,6 +37,9 @@ struct HomeView: View {
         .onAppear {
             deviceVM.refresh()
         }
+        .sheet(isPresented: $showDiagnostics) {
+            ConnectionDiagnosticsView()
+        }
     }
 
     // MARK: - Mode banner
@@ -43,20 +47,26 @@ struct HomeView: View {
     private var modeBanner: some View {
         HStack {
             Spacer()
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(modeColor)
-                    .frame(width: 7, height: 7)
-                    .opacity(connectionManager.mode == .offline ? 0.5 : 1)
+            Button { showDiagnostics = true } label: {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(modeColor)
+                        .frame(width: 7, height: 7)
+                        .opacity(connectionManager.mode == .offline ? 0.5 : 1)
 
-                Text(connectionManager.mode.displayName)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(modeColor)
+                    Text(connectionManager.mode.displayName)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(modeColor)
+
+                    Image(systemName: "info.circle")
+                        .font(.caption2)
+                        .foregroundColor(modeColor.opacity(0.6))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(modeColor.opacity(0.12))
+                .clipShape(Capsule())
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(modeColor.opacity(0.12))
-            .clipShape(Capsule())
 
             // Sign out button
             Button {
@@ -87,9 +97,9 @@ struct HomeView: View {
         if connectionManager.mode.isLocal {
             ScheduleView()
         } else if deviceVM.status.isRecentlyOnline {
-            ZStack(alignment: .top) {
-                ScheduleView()
+            VStack(spacing: 0) {
                 remoteSyncBanner
+                ScheduleView()
             }
         } else {
             VStack(spacing: 16) {

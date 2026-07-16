@@ -428,15 +428,17 @@ struct ZoneEditorSheet: View {
                 List {
                     ForEach($vm.zones) { $zone in
                         VStack(alignment: .leading, spacing: 10) {
+                            TextField("e.g. Front Lawn", text: Binding(
+                                get: { zone.name },
+                                set: { zone.name = $0; vm.hasUnsavedChanges = true }
+                            )).font(.title2).foregroundColor(.white)
+
                             Toggle(isOn: Binding(
                                 get: { zone.enabled },
                                 set: { zone.enabled = $0; vm.hasUnsavedChanges = true }
                             )) {
-                                
-                                TextField("e.g. Front Lawn", text: Binding(
-                                    get: { zone.name },
-                                    set: { zone.name = $0; vm.hasUnsavedChanges = true }
-                                )).font(.title2).foregroundColor(.white.opacity(0.5))
+                                Text("Enabled")
+                                    .font(.subheadline).foregroundColor(.white.opacity(0.5))
                             }
                             .tint(Color(hex: "42A5F5"))
 
