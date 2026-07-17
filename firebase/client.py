@@ -10,6 +10,7 @@
 
 import ujson
 import utime
+import gc
 
 try:
     import urequests as requests
@@ -94,9 +95,14 @@ class FirebaseClient:
             # Guarantee the socket is released even if resp.json() raises on
             # a malformed/truncated body -- otherwise it leaks and the fixed
             # lwIP socket pool eventually runs out (ENOMEM on some later,
-            # unrelated request).
+            # unrelated request). gc.collect() right after close(): TLS
+            # buffers freed here tend to leave the heap fragmented rather
+            # than cleanly reusable, and without an explicit collect the next
+            # request's handshake can ENOMEM even though there's technically
+            # enough free memory in total, just not contiguously.
             if resp is not None:
                 resp.close()
+            gc.collect()
 
     def _refresh_if_needed(self):
         """Re-authenticate if the token is within 5 minutes of expiry (3600s)."""
@@ -143,6 +149,7 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            gc.collect()
 
     def patch(self, path, data_dict):
         """
@@ -175,6 +182,7 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            gc.collect()
 
     def put(self, path, value):
         """
@@ -203,3 +211,4 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            gc.collect()

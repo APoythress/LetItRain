@@ -8,7 +8,9 @@
 | **Local** | iOS app ↔ Pico HTTP API directly over Wi-Fi. Full control. |
 | **Remote** | iOS app reads Firebase status (read-only). Can skip today's run. |
 
-The Pico only ever **writes** to Firebase (status heartbeat every 15s, local IP on boot). It reads only the `overrides` node to check for skip signals. Firebase is never in the command path for relay control.
+The Pico only ever **writes** to Firebase (status heartbeat every 30s, local IP on boot). It reads only the `overrides` node to check for skip signals. Firebase is never in the command path for relay control.
+
+**Safety net:** a hardware watchdog (`machine.WDT`, 8s timeout) is armed once boot completes. It's fed after each network operation in the main loop and every 100ms while idle — if the loop ever stops reaching those points for 8 seconds (a hang of any kind, regardless of cause), the board hard-resets. `relay.all_off()` unconditionally runs first on every boot, so a stuck-open zone always gets shut off within seconds even if the software issue that caused the hang is never diagnosed.
 
 ---
 
@@ -245,7 +247,7 @@ The Pico checks for a new firmware version on every boot and every 6 hours while
 Check `update_status.json` on the device (via Thonny), or `devices/{id}/update` in Firebase, for the current state (`idle` / `checking` / `downloading` / `staged` / `error`) if an update doesn't seem to be landing.
 
 ### Manual "check now" from the app
-The Dashboard's Device Info card has a "Check for Update" button — it writes `devices/{id}/update/requested = true`. The Pico checks that flag every 15s (the same cadence as its status heartbeat), clears it immediately so it only fires once, and runs `check_for_update()` right away instead of waiting for the 6-hour timer. Current status/progress is pushed to the same `update` node every 15s so the app can show it live.
+The Dashboard's Device Info card has a "Check for Update" button — it writes `devices/{id}/update/requested = true`. The Pico checks that flag every 45s, clears it immediately so it only fires once, and runs `check_for_update()` right away instead of waiting for the 6-hour timer. Current status/progress is pushed to the same `update` node every 45s so the app can show it live.
 
 ---
 

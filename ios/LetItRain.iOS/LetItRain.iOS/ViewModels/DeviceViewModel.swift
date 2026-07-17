@@ -111,9 +111,18 @@ final class DeviceViewModel: ObservableObject {
 
     // MARK: - Local polling
 
+    // The Pico's HTTP server handles exactly one connection at a time --
+    // there's no real concurrency on that side, and every request is a
+    // resource competing with its Firebase/TLS traffic for very limited RAM.
+    // The app tolerates 30-45s of staleness on everything, so this polls
+    // status every 30s and config every other tick (60s -- it rarely
+    // changes anyway), one request at a time rather than concurrently.
+    private var localPollCount = 0
+
     private func startLocalPolling() {
         stopLocalPolling()
-        localRefreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        localPollCount = 0
+        localRefreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.refreshLocal() }
         }
         Task { await refreshLocal() }
@@ -127,10 +136,13 @@ final class DeviceViewModel: ObservableObject {
     private func refreshLocal() async {
         guard let client = localClient else { return }
         do {
-            async let s = client.fetchStatus()
-            async let c = client.fetchConfig()
-            let (newStatus, newConfig) = try await (s, c)
+            let newStatus = try await client.fetchStatus()
             status = newStatus
+
+            localPollCount += 1
+            guard localPollCount % 2 == 0 || config == nil else { return }
+
+            let newConfig = try await client.fetchConfig()
             config = newConfig
             if !scheduleVM.hasUnsavedChanges {
                 scheduleVM.load(from: newConfig)

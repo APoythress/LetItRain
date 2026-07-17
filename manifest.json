@@ -1,8 +1,7 @@
 {
-  "version": "1.2.5",
+  "version": "1.2.13",
   "files": [
     { "path": "main.py" },
-    { "path": "set_rtc_once.py" },
     { "path": "web/server.py" }
   ]
 }

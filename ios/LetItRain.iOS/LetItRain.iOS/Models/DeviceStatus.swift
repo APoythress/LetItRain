@@ -19,12 +19,13 @@ struct DeviceStatus: Codable {
     var firmwareVersion:   String?
 
     var isRecentlyOnline: Bool {
-        // Heartbeat interval is 15s, but the Pico's loop runs single-threaded
-        // with blocking HTTPS calls (scheduler, schedule sync, etc. all share
-        // the same pass), so the actual gap between heartbeats jitters more
-        // than a tight 30s window comfortably allows. 45s gives real margin
-        // without meaningfully hurting how "live" the status feels.
-        Date().timeIntervalSince1970 - lastHeartbeat < 45
+        // Heartbeat interval is 30s (relaxed from 15s to ease load on the
+        // Pico), and the app's own tolerance for staleness is 30-45s, so
+        // this needs real margin over 30s rather than being tight against
+        // it. 90s (3x the heartbeat) absorbs normal jitter from the Pico's
+        // single-threaded loop without flickering "offline" during a
+        // temporarily slow (but not actually dead) cycle.
+        Date().timeIntervalSince1970 - lastHeartbeat < 90
     }
 
     var remainingSeconds: TimeInterval? {

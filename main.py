@@ -11,7 +11,7 @@
 
 import utime
 import _thread
-from machine import I2C, Pin, reset
+from machine import I2C, Pin, reset, WDT
 
 from secrets import (
     WIFI_SSID, WIFI_PASSWORD,
@@ -230,6 +230,19 @@ def main():
                     break
     except Exception as ex:
         print("Wi-Fi failed (non-fatal, running offline):", ex)
+        # connect_wifi() can time out right as the connection is actually
+        # completing (status flips CONNECTING -> NOIP -> UP in the last
+        # couple of attempts, then DHCP finishes moments after we gave up).
+        # One more check here, on a fresh handle to the same physical
+        # interface, catches that instead of silently keeping 0.0.0.0.
+        try:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+            if wlan.isconnected():
+                local_ip = wlan.ifconfig()[0]
+                print("Wi-Fi: connected shortly after timeout, IP:", local_ip)
+        except Exception:
+            pass
 
     # --- NTP time sync ---
     # Without this, utime.time() stays at its arbitrary boot-time default
@@ -306,11 +319,35 @@ def main():
     last_ip_push       = utime.time()
     last_update_check  = utime.time()
     last_ota_poll      = utime.time()
-    STATUS_INTERVAL   = 15
-    SYNC_INTERVAL     = 60
+    last_ota_status_pushed = None
+    # Relaxed from the original 15/60/30s: the app tolerates 30-45s of
+    # staleness on everything, and every one of these is a Firebase/TLS
+    # round-trip competing for this board's limited RAM -- halving the call
+    # rate directly eases that pressure, not just a latency trade-off.
+    STATUS_INTERVAL   = 30
+    SYNC_INTERVAL     = 90
     IP_PUSH_INTERVAL  = 300  # re-check/re-push local_ip every 5 min
     UPDATE_CHECK_INTERVAL = 21600  # 6 hours
-    OTA_POLL_INTERVAL = 30   # manual "check now" trigger + status push
+    OTA_POLL_INTERVAL = 45   # manual "check now" trigger + status push
+
+    # --- Hardware watchdog ---
+    # Armed only now, not any earlier: boot (Wi-Fi retries alone can take up
+    # to ~20s) legitimately exceeds the RP2040's ~8.3s max WDT timeout, so
+    # arming it before this point would false-trigger during a normal boot.
+    #
+    # Fed after each section below (heartbeat, OTA poll, IP check, schedule
+    # sync, ...) and every 100ms in the LED-tick loop -- not wrapped around
+    # any single blocking call. Each Firebase call has its own ~8s internal
+    # timeout, and several can legitimately fire in the same pass (e.g. right
+    # after boot), so feeding only once per full iteration could stack those
+    # timeouts past 8s during an ordinary internet outage and false-trigger.
+    # Feeding between sections means only a call that never returns at all
+    # (I2C contention, a truly hung socket, memory exhaustion, whatever the
+    # next weird lockup turns out to be) goes unfed long enough to reset.
+    # relay.all_off() is unconditionally the first thing that runs on every
+    # boot, so this guarantees water stops within seconds of any such hang,
+    # even one we never manage to root-cause.
+    wdt = WDT(timeout=8000)
 
     print("Main loop started.")
 
@@ -320,6 +357,7 @@ def main():
                 now_epoch       = get_now_epoch()             # true UTC — run/Firebase math
                 local_epoch     = get_local_wall_clock_epoch()  # local wall clock — scheduling only
                 now_date_string = get_now_date_string()
+                wdt.feed()  # covers I2C/RTC access above, if that's ever the hang
 
                 # --- Stop check ---
                 if state.should_stop_now(now_epoch):
@@ -359,10 +397,10 @@ def main():
                             last_run_slots[slot_key] = local_epoch
 
                 # --- Firebase heartbeat ---
-                # Kept to a single request: the app's "device online" check is
-                # a tight ~30s freshness window, and this loop is single-
-                # threaded, so anything else stacked here directly delays how
-                # often this specific call can land.
+                # Kept to a single request: this loop is single-threaded, so
+                # anything else stacked here directly delays how often this
+                # specific call can land, and it's the one the app's
+                # "device online" freshness check depends on.
                 if utime.time() - last_status_push >= STATUS_INTERVAL:
                     try:
                         status_writer.push_status(
@@ -374,6 +412,7 @@ def main():
                         print("Firebase heartbeat failed (non-fatal):", ex)
                         status_led.set_mode("no_internet")
                     last_status_push = utime.time()
+                    wdt.feed()
 
                 # --- Manual OTA trigger + status push ---
                 # Own interval, separate from the heartbeat above, so a
@@ -389,12 +428,20 @@ def main():
                         except Exception as ex:
                             print("OTA trigger check failed (non-fatal):", ex)
 
-                    try:
-                        fb.patch("update", get_ota_status())
-                    except Exception:
-                        pass
+                    # Skip the push entirely when nothing changed -- this is
+                    # "idle" nearly every tick in normal operation, and every
+                    # skipped push is one fewer TLS handshake competing for
+                    # this board's very limited RAM.
+                    current_ota_status = get_ota_status()
+                    if current_ota_status != last_ota_status_pushed:
+                        try:
+                            if fb.patch("update", current_ota_status):
+                                last_ota_status_pushed = current_ota_status
+                        except Exception:
+                            pass
 
                     last_ota_poll = utime.time()
+                    wdt.feed()
 
                 # --- Local IP re-check ---
                 # Catches DHCP lease renewals / router reboots that hand the
@@ -416,6 +463,7 @@ def main():
                         except Exception as ex:
                             print("Firebase push_ip failed (non-fatal):", ex)
                     last_ip_push = utime.time()
+                    wdt.feed()
 
                 # --- Schedule sync ---
                 if utime.time() - last_schedule_sync >= SYNC_INTERVAL:
@@ -426,6 +474,7 @@ def main():
                     except Exception as ex:
                         print("Schedule sync failed (non-fatal):", ex)
                     last_schedule_sync = utime.time()
+                    wdt.feed()
 
                 # --- OTA update check ---
                 if not update_pending and utime.time() - last_update_check >= UPDATE_CHECK_INTERVAL:
@@ -435,6 +484,7 @@ def main():
                         except Exception as ex:
                             print("OTA update check failed (non-fatal):", ex)
                     last_update_check = utime.time()
+                    wdt.feed()
 
                 # An update was downloaded and is staged — apply it as soon as
                 # no zone is actively running, so a reboot never cuts a run short.
@@ -449,8 +499,11 @@ def main():
 
             # Tick the LED every 100ms during the 5s pause so its pattern
             # stays accurate instead of only updating once per loop pass.
+            # Also feeds the watchdog -- see the WDT comment above for why
+            # it's fed here specifically and nowhere else.
             for _ in range(50):
                 status_led.tick()
+                wdt.feed()
                 utime.sleep_ms(100)
 
     finally:

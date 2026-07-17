@@ -106,6 +106,16 @@ final class ConnectionManager: ObservableObject {
     private var evaluationTimer: Timer?
     private var currentPath: NWPath?
 
+    /// Debounce floor between evaluations. Without this, a flapping Pico
+    /// (e.g. under memory pressure) can produce a tight feedback loop: mode
+    /// change -> immediate local poll -> poll fails -> evaluate() -> mode
+    /// change -> ... with no natural floor on how fast it spins, since
+    /// "meta updated" and "local poll failed" can both re-trigger on every
+    /// single cycle. isEvaluating alone only prevents true concurrency, not
+    /// back-to-back re-entry the instant the previous one finishes.
+    private var lastEvaluationStart: Date?
+    private let minEvaluationInterval: TimeInterval = 2.0
+
     /// Injected by ContentView after FirebaseRepository is created.
     /// Weak to avoid retain cycle.
     var metaProvider: (() async -> DeviceMeta?)? = nil
@@ -153,8 +163,8 @@ final class ConnectionManager: ObservableObject {
     // MARK: - Periodic re-evaluation
 
     private func startPeriodicEvaluation() {
-        evaluationTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.evaluate(reason: "30s timer")
+        evaluationTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
+            self?.evaluate(reason: "45s timer")
         }
     }
 
@@ -175,6 +185,11 @@ final class ConnectionManager: ObservableObject {
             logger.debug("runEvaluation skipped — already evaluating (trigger: \(trigger, privacy: .public))")
             return
         }
+        if let last = lastEvaluationStart, Date().timeIntervalSince(last) < minEvaluationInterval {
+            logger.debug("runEvaluation skipped — debounced, too soon after last (trigger: \(trigger, privacy: .public))")
+            return
+        }
+        lastEvaluationStart = Date()
         isEvaluating = true
         defer { isEvaluating = false }
 

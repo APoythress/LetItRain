@@ -147,6 +147,7 @@ def check_for_update(bucket, id_token):
         manifest = resp.json()
         resp.close()
         resp = None
+        gc.collect()
 
         remote_version = manifest.get("version", "0.0.0")
         local_version  = get_local_version()

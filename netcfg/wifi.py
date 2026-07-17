@@ -7,7 +7,7 @@ import network
 import utime
 
 
-def connect_wifi(ssid, password, max_attempts=20, delay_ms=500, on_wait=None):
+def connect_wifi(ssid, password, max_attempts=40, delay_ms=500, on_wait=None):
     """
     Connect to Wi-Fi and return the wlan interface object.
 

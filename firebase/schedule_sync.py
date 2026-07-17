@@ -62,9 +62,15 @@ class ScheduleSync:
                     merged_zones.append(zone)
             if merged_zones:
                 merged_zones.sort(key=lambda z: z["id"])
-                self._config["zones"] = merged_zones
-                self._config["zone_count"] = len([z for z in merged_zones if z["enabled"]])
-                changed = True
+                # Only actually replace + flag changed if the content is
+                # different -- this ran unconditionally before, meaning a
+                # fresh dict/list allocation AND a flash write every single
+                # 60s cycle forever, even when nothing changed (which is
+                # nearly always the case).
+                if merged_zones != self._config.get("zones"):
+                    self._config["zones"] = merged_zones
+                    self._config["zone_count"] = len([z for z in merged_zones if z["enabled"]])
+                    changed = True
 
         # --- Schedule ---
         schedule_data = self._fb.get("schedule")
@@ -98,8 +104,9 @@ class ScheduleSync:
                 else:
                     merged_schedule[day] = {"enabled": False, "slots": []}
 
-            self._config["schedule"] = merged_schedule
-            changed = True
+            if merged_schedule != self._config.get("schedule"):
+                self._config["schedule"] = merged_schedule
+                changed = True
 
         if changed:
             self._save_config(self._config)
