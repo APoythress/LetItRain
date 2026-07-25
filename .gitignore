@@ -125,3 +125,13 @@ dmypy.json
 
 # Secrets
 .secrets.py
+# v1.1.0 additions
+secrets.py
+cloud_functions/node_modules/
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcworkspace/xcuserdata/
+*.DS_Store
+GoogleService-Info.plist
+
+# Device-written runtime state, not source
+update_status.json

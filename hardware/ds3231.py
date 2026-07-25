@@ -43,5 +43,9 @@ class DS3231:
 
     def iso_string(self):
         y, mo, d, h, mi, s, _wd = self.datetime_tuple()
-        print("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(y, mo, d, h, mi, s))
+        # Formats once and just returns it -- previously formatted the same
+        # string twice (once to print as an unwanted side effect of a
+        # getter, once to return), so every call to a "read the date"
+        # function did a needless duplicate allocation, and every caller
+        # that also prints the result (main.py does) got it printed twice.
         return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(y, mo, d, h, mi, s)

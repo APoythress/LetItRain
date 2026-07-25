@@ -1,37 +1,28 @@
+# storage/config_store.py
+# Persists config to Pico flash as JSON.
+
 import ujson
+
 
 CONFIG_PATH = "config.json"
 
-def default_config():
-    return {
-        "device_name": "Pico Sprinkler Controller",
-        "relay_pin": 15,
-        "relay_active_high": True,
-        "manual_default_duration_minutes": 10,
-        "schedule": {
-            "enabled": False,
-            "days": [],
-            "start_hour": 6,
-            "start_minute": 0,
-            "duration_minutes": 10
-        },
-        "last_run": {
-            "start_epoch": None,
-            "end_epoch": None,
-            "mode": None,
-            "status": None
-        }
-    }
 
-def load_config(path=CONFIG_PATH):
+def load_config():
+    """Load config from flash. Returns empty dict on any error."""
     try:
-        with open(path, "r") as f:
+        with open(CONFIG_PATH, "r") as f:
             return ujson.load(f)
-    except OSError:
-        cfg = default_config()
-        save_config(cfg, path)
-        return cfg
+    except Exception as ex:
+        print("config_store: load failed:", ex)
+        return {}
 
-def save_config(config, path=CONFIG_PATH):
-    with open(path, "w") as f:
-        ujson.dump(config, f)
+
+def save_config(config):
+    """Persist config dict to flash."""
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            ujson.dump(config, f)
+        return True
+    except Exception as ex:
+        print("config_store: save failed:", ex)
+        return False

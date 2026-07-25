@@ -1,202 +1,220 @@
-import socket
-import network
-import utime
-from core.scheduler import next_run_epoch
-from web.html import render_dashboard
-from storage.config_store import save_config
-from update.updater import check_for_update
+# web/server.py
+# Local HTTP JSON API. Multi-zone aware.
+#
+# Endpoints:
+#   GET  /status          → current run status (zone-aware)
+#   GET  /config          → full config including zones and schedule
+#   POST /start           → {"zone_id": 1, "duration_minutes": 10}
+#   POST /stop            → stop current zone
+#   POST /config          → replace config (zones + schedule)
+#   POST /skip-today      → set local skip override
+#   POST /cancel-skip     → clear local skip override
 
-def connect_wifi(ssid, password, timeout_seconds=20):
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+import ujson
+import usocket
+import gc
 
-    if wlan.isconnected():
-        return wlan
-
-    wlan.connect(ssid, password)
-    start = utime.time()
-
-    while not wlan.isconnected():
-        if utime.time() - start > timeout_seconds:
-            raise RuntimeError("Wi-Fi connection timed out")
-        utime.sleep(1)
-
-    return wlan
-
-def parse_query(path):
-    if "?" not in path:
-        return path, {}
-
-    route, query = path.split("?", 1)
-    params = {}
-
-    for pair in query.split("&"):
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-
-            # basic decode for this project
-            v = v.replace("%3A", ":").replace("%2C", ",").replace("+", " ")
-
-            if k in params:
-                if isinstance(params[k], list):
-                    params[k].append(v)
-                else:
-                    params[k] = [params[k], v]
-            else:
-                params[k] = v
-
-    return route, params
+from core import mem_diag
 
 
-def http_response(body, content_type="text/html"):
-    return "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nConnection: close\r\n\r\n{}".format(content_type, body)
+def _json_response(conn, status_code, data_dict):
+    body = ujson.dumps(data_dict)
+    status_line = {200: "200 OK", 400: "400 Bad Request",
+                   405: "405 Method Not Allowed", 500: "500 Internal Server Error"
+                   }.get(status_code, "{} Unknown".format(status_code))
+    header = (
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\n"
+        "Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(status_line, len(body))
+    try:
+        # Sent as two pieces rather than one combined+encoded string: for a
+        # response like /config or /logs, concatenating header+body into one
+        # string and then encoding it means 3 full-size copies of roughly the
+        # same data alive at once (json string, combined string, encoded
+        # bytes) at exactly the moment memory is already tightest.
+        conn.sendall(header.encode())
+        conn.sendall(body.encode())
+    finally:
+        conn.close()
+    mem_diag.sample()
+    gc.collect()
 
-def redirect(location="/"):
-    return "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n".format(location)
 
-def run_server(config, state, rtc, on_manual_start, on_manual_stop, on_sync_rtc):
-    addr = socket.getaddrinfo("0.0.0.0", 8080)[0][-1]
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def _read_request(conn, max_bytes=16384):
+    """
+    Read a full HTTP request, looping recv() until the header block AND the
+    full Content-Length body have arrived.
+
+    A single recv() call can return only the headers if the client sends
+    headers and body as separate TCP writes (common for POST requests over
+    Wi-Fi) -- this was silently truncating request bodies (e.g. a manual
+    start's duration_minutes), leaving _parse_request() with an empty body
+    and falling back to defaults with no visible error.
+
+    Chunks are collected in a list and joined once at the end rather than
+    repeated `data += chunk`, which reallocates and copies the entire
+    buffer-so-far on every append (O(n^2) for a multi-chunk body, and each
+    intermediate copy is immediately garbage). max_bytes dropped from a
+    generic 64KB to 16KB -- every real local payload (JSON commands, the
+    full schedule) is a few KB at most, so this just caps the worst case
+    tighter without touching any legitimate request.
+    """
+    conn.settimeout(5)
+    chunks = []
+    total = 0
+    header_end = -1
+    header_bytes = b""
+
+    while header_end == -1:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        header_bytes = b"".join(chunks)
+        header_end = header_bytes.find(b"\r\n\r\n")
+        if total > max_bytes:
+            return header_bytes
+
+    header_text = header_bytes[:header_end].decode("utf-8", "ignore")
+    content_length = 0
+    for line in header_text.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            try:
+                content_length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                content_length = 0
+            break
+
+    body_so_far = total - (header_end + 4)
+    while body_so_far < content_length and total < max_bytes:
+        chunk = conn.recv(1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        body_so_far += len(chunk)
+
+    return b"".join(chunks)
+
+
+def _parse_request(raw):
+    try:
+        text   = raw.decode("utf-8", "ignore")
+        lines  = text.split("\r\n")
+        parts  = lines[0].split(" ")
+        method = parts[0] if len(parts) > 0 else "GET"
+        path   = parts[1].split("?")[0] if len(parts) > 1 else "/"
+        body_dict = None
+        if "\r\n\r\n" in text:
+            body_str = text.split("\r\n\r\n", 1)[1].strip()
+            if body_str:
+                try:
+                    body_dict = ujson.loads(body_str)
+                except Exception:
+                    pass
+        return method, path, body_dict
+    except Exception:
+        return "GET", "/", None
+
+
+def run_server(config, state, rtc, on_manual_start, on_manual_stop,
+               local_override, save_config_fn, now_fn, firmware_version):
+    addr = usocket.getaddrinfo("0.0.0.0", 80)[0][-1]
+    server = usocket.socket()
+    server.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
     server.bind(addr)
-    server.listen(5)
-    print("Web server listening on", addr)
-    print("Server: ", server)
+    server.listen(5)  # a manual start/stop triggers an immediate extra poll on
+                       # top of the regular 3s timer, so short bursts of 3-4
+                       # near-simultaneous local requests are normal
+    print("HTTP server listening on port 80")
+
     while True:
-        client, _ = server.accept()
+        conn = None
         try:
-            client.settimeout(2)
-            raw = client.recv(1024)
+            conn, client_addr = server.accept()
+            raw = _read_request(conn)
+            method, path, body = _parse_request(raw)
+            # /status is polled every few seconds by design (app poll +
+            # connection probe) -- logging every hit just crowds out the
+            # actually-interesting lines (commands, errors) in the capped
+            # /logs buffer. Everything else still logs normally.
+            if path != "/status":
+                print("HTTP {} {} from {}".format(method, path, client_addr))
 
-            if not raw:
-                client.close()
-                continue
+            if method == "GET" and path == "/status":
+                last = config.get("last_run", {})
+                s    = state
+                _json_response(conn, 200, {
+                    "is_running":         s.is_running(),
+                    "active_zone_id":     s.current_zone_id if s.is_running() else None,
+                    "current_mode":       s.current_run_mode if s.is_running() else "idle",
+                    "run_started_at":     s.current_run_start_epoch if s.is_running() else None,
+                    "run_ends_at":        s.run_ends_at() if s.is_running() else None,
+                    "last_run_start":     last.get("start_epoch"),
+                    "last_run_end":       last.get("end_epoch"),
+                    "last_run_mode":      last.get("mode"),
+                    "last_run_zone_id":   last.get("zone_id"),
+                    "last_run_status":    last.get("status"),
+                    "active_skip":        local_override["skip_today"],
+                    "active_skip_reason": local_override["skip_reason"],
+                    "device_online":      True,
+                    "last_heartbeat":     now_fn(),
+                    "firmware_version":   firmware_version,
+                    "free_mem_bytes":     gc.mem_free(),
+                    "min_free_mem_bytes": mem_diag.min_free(),
+                    "heap_total_bytes":   mem_diag.heap_total(),
+                })
 
-            request = raw.decode("utf-8")
-            request_line = request.split("\r\n")[0]
-            method, path, _proto = request_line.split(" ", 2)
-            route, params = parse_query(path)
+            elif method == "GET" and path == "/config":
+                _json_response(conn, 200, config)
 
-            print(request)
+            elif method == "POST" and path == "/start":
+                zone_id  = int(body.get("zone_id",  1)) if body else 1
+                duration = int(body.get("duration_minutes",
+                               config.get("manual_default_duration_minutes", 10))) if body else 10
+                on_manual_start(zone_id, duration)
+                _json_response(conn, 200, {"started": True,
+                                           "zone_id": zone_id,
+                                           "duration_minutes": duration})
 
-            if route == "/favicon.ico":
-                client.send(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-            
-            # Manual update trigger
-            elif route == "/update":
-                client.send(http_response(
-                    "<html><body><h1>Update Started</h1><p>Check the dashboard again in a few seconds.</p></body></html>"
-                ).encode())
-
-                client.close()
-                client = None
-
-                try:
-                    check_for_update()
-                except Exception as ex:
-                    print("Update failed:", ex)
-                continue
-
-            # Manually sync rtc
-            elif route == "/sync-rtc":
-                try:
-                    new_time = on_sync_rtc()
-                    client.send(http_response(
-                        "<html><body><h1>RTC Synced</h1><p>New RTC time: {}</p><p><a href='/'>Back</a></p></body></html>".format(new_time)
-                    ).encode())
-                except Exception as ex:
-                    client.send(http_response(
-                        "<html><body><h1>RTC Sync Error</h1><pre>{}</pre><p><a href='/'>Back</a></p></body></html>".format(str(ex))
-                    ).encode())
-
-
-            # Manual start
-            elif route == "/start":
-                on_manual_start()
-                client.send(redirect().encode())
-
-            # Manual stop
-            elif route == "/stop":
+            elif method == "POST" and path == "/stop":
                 on_manual_stop()
-                client.send(redirect().encode())
+                _json_response(conn, 200, {"stopped": True})
 
-            # Manual save 
-            elif route == "/save":
-                try:
-                    schedule = config["schedule"]
+            elif method == "POST" and path == "/config":
+                if body and isinstance(body, dict):
+                    for k, v in body.items():
+                        config[k] = v
+                    save_config_fn(config)
+                    _json_response(conn, 200, {"saved": True})
+                else:
+                    _json_response(conn, 400, {"error": "invalid JSON body"})
 
-                    enabled_raw = str(params.get("enabled", "0")).strip()
-                    appt_raw = str(params.get("appt", "06:00")).strip()
-                    duration_raw = str(params.get("duration", str(schedule.get("duration_minutes", 10)))).strip()
+            elif method == "POST" and path == "/skip-today":
+                local_override["skip_today"]  = True
+                local_override["skip_reason"] = "manual_local"
+                _json_response(conn, 200, {"skipped": True, "reason": "manual_local"})
 
-                    days_raw = params.get("days", [])
-                    if not isinstance(days_raw, list):
-                        days_raw = [days_raw]
+            elif method == "POST" and path == "/cancel-skip":
+                local_override["skip_today"]  = False
+                local_override["skip_reason"] = None
+                _json_response(conn, 200, {"skipped": False})
 
-                    print("SAVE PARAMS:")
-                    print("enabled =", enabled_raw)
-                    print("days    =", days_raw)
-                    print("appt    =", appt_raw)
-                    print("duration=", duration_raw)
-
-                    schedule["enabled"] = enabled_raw == "1"
-
-                    day_list = []
-                    for x in days_raw:
-                        x = str(x).strip()
-                        if x != "":
-                            day_list.append(int(x))
-                    schedule["days"] = sorted(day_list)
-
-                    if ":" not in appt_raw:
-                        raise ValueError("Time must be in HH:MM format")
-
-                    hour_str, minute_str = appt_raw.split(":", 1)
-                    schedule["start_hour"] = int(hour_str)
-                    schedule["start_minute"] = int(minute_str)
-                    schedule["duration_minutes"] = int(duration_raw)
-
-                    print("NEW SCHEDULE =", schedule)
-
-                    save_config(config)
-                    client.send(redirect().encode())
-
-                except Exception as ex:
-                    print("SAVE ERROR:", ex)
-                    client.send(http_response(
-                        "<h1>Save Error</h1><pre>{}</pre><p><a href='/'>Back</a></p>".format(str(ex))
-                    ).encode())
-
-
-            # Dashboard
             else:
-                now_epoch = rtc.epoch()
-                now_iso = rtc.iso_string()
-
-
-                body = render_dashboard(
-                    config=config,
-                    state=state,
-                    now_iso=now_iso,
-                    next_run_epoch=next_run_epoch(config.get("schedule", {}), now_epoch),
-                )
-                response = http_response(body).encode()
-                client.send(response)
-                utime.sleep_ms(50)
+                _json_response(conn, 405, {"error": "not found", "path": path})
 
         except Exception as ex:
-            print("Server error:", ex)
-            try:
-                if client is not None:
-                    client.send(http_response(
-                        "<h1>Error</h1><pre>{}</pre>".format(str(ex))
-                    ).encode())
-            except Exception as send_ex:
-                print("Could not send error response:", send_ex)
-
-        
-        finally:
-            try:
-                client.close()
-            except:
-                pass
+            # Covers OSError (timeout/reset from _read_request's settimeout,
+            # a dropped connection mid-request, etc.) as well as anything
+            # else -- every path here MUST close conn, or a leaked socket
+            # on this board's very small lwIP pool eventually starves both
+            # this server and the outbound Firebase/OTA calls on the main
+            # loop thread that share the same pool.
+            print("HTTP server error:", ex)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass

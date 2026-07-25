@@ -1,156 +1,199 @@
-import socket
-import machine
-import ujson
-import utime
-import os
+# update/updater.py
+# Over-the-air firmware updates via Firebase Cloud Storage.
+#
+# Flow:
+#   1. Download ota/manifest.json from Storage:
+#      {"version": "1.3.0", "files": [{"path": "main.py"}, ...], "deletes": ["old/file.py"]}
+#   2. Compare manifest version to local version.json
+#   3. If newer, download every listed file from ota/{version}/{path} to its
+#      on-device path, remove every path listed in "deletes", then overwrite
+#      local version.json.
+#
+# "deletes" exists because "files" can only ever add or overwrite -- there is
+# nothing to download for a file that should stop existing, so removing an
+# entry from "files" does not remove it from already-updated devices. Add its
+# path to "deletes" instead.
+#
+# This module only ever reads from Storage — updates are published by
+# uploading new files to the bucket yourself (Firebase Console or gsutil),
+# there is no write path here.
+#
+# Reuses the Firebase ID token from the already-authenticated FirebaseClient
+# (RTDB and Storage both accept the same Firebase Auth ID token) rather than
+# signing in separately.
 
-VERSION_URL = "http://raw.githubusercontent.com/APoythress/LetItRain/main/version.json"
+import ujson
+import os
+import gc
+
+from core import mem_diag
+
+try:
+    import urequests as requests
+except ImportError:
+    import requests  # fallback for local testing
+
 LOCAL_VERSION_FILE = "version.json"
 UPDATE_STATUS_FILE = "update_status.json"
+MANIFEST_PATH       = "ota/manifest.json"
+_REQUEST_TIMEOUT    = 15  # firmware files are small, but allow more than RTDB's 8s
+_DOWNLOAD_CHUNK_SIZE = 512  # read/write in small pieces so we never need one
+                             # big contiguous allocation for the whole file
 
 
-def set_update_status(status, message):
-    data = {
-        "status": status,
-        "message": message,
-        "updated_at": utime.time()
-    }
-    with open(UPDATE_STATUS_FILE, "w") as f:
-        ujson.dump(data, f)
+def _storage_url(bucket, object_path):
+    # Firebase Storage REST API requires the object path's slashes to be
+    # percent-encoded, since they're part of the object name, not a real path.
+    encoded = object_path.replace("/", "%2F")
+    return "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media".format(
+        bucket, encoded
+    )
 
 
-def get_update_status():
+def _set_status(status, message):
+    try:
+        with open(UPDATE_STATUS_FILE, "w") as f:
+            ujson.dump({"status": status, "message": message}, f)
+    except Exception:
+        pass  # diagnostic only, never fatal
+
+
+def get_status():
+    """Current OTA status, for forwarding to Firebase so the app can show progress."""
     try:
         with open(UPDATE_STATUS_FILE, "r") as f:
             return ujson.load(f)
-    except:
-        return {
-            "status": "unknown",
-            "message": "No update status file found."
-        }
+    except Exception:
+        return {"status": "idle", "message": "No update attempted yet."}
 
 
 def get_local_version():
     try:
         with open(LOCAL_VERSION_FILE, "r") as f:
-            data = ujson.load(f)
-            return data.get("version", "0.0.0")
-    except:
+            return ujson.load(f).get("version", "0.0.0")
+    except Exception:
         return "0.0.0"
 
 
-def save_local_version(version):
+def _save_local_version(version):
     with open(LOCAL_VERSION_FILE, "w") as f:
         ujson.dump({"version": version}, f)
 
 
-def parse_version(version):
-    return [int(x) for x in version.split(".")]
+def _parse_version(v):
+    return [int(x) for x in v.split(".")]
 
 
-def is_newer(remote_version, local_version):
-    return parse_version(remote_version) > parse_version(local_version)
+def _is_newer(remote_version, local_version):
+    return _parse_version(remote_version) > _parse_version(local_version)
 
 
-def parse_url(url):
-    if not url.startswith("http://"):
-        raise ValueError("For now, use http:// URLs only.")
-
-    url = url[7:]
-    parts = url.split("/", 1)
-    host = parts[0]
-    path = "/" + parts[1] if len(parts) > 1 else "/"
-    return host, path
-
-
-def http_get(url):
-    host, path = parse_url(url)
-
-    addr = socket.getaddrinfo(host, 80)[0][-1]
-    s = socket.socket()
-    s.connect(addr)
-
-    req = (
-        "GET {} HTTP/1.1\r\n"
-        "Host: {}\r\n"
-        "Connection: close\r\n\r\n"
-    ).format(path, host)
-
-    s.send(req.encode())
-
-    response = b""
-    while True:
-        chunk = s.recv(1024)
-        if not chunk:
-            break
-        response += chunk
-
-    s.close()
-
-    parts = response.split(b"\r\n\r\n", 1)
-    if len(parts) != 2:
-        raise RuntimeError("Invalid HTTP response")
-
-    headers, body = parts
-    return body
-
-
-def ensure_parent_folders(path):
-    parts = path.split("/")
+def _ensure_parent_dirs(path):
+    parts = path.split("/")[:-1]
     current = ""
-    for part in parts[:-1]:
-        if not part:
-            continue
+    for part in parts:
         current = current + "/" + part if current else part
         try:
             os.mkdir(current)
         except OSError:
-            pass
+            pass  # already exists
 
 
-def download_file(file_info):
-    path = file_info["path"]
-    url = file_info["url"]
-
-    set_update_status("downloading", "Downloading {}".format(path))
-    content = http_get(url)
-
-    ensure_parent_folders(path)
-
-    with open(path, "wb") as f:
-        f.write(content)
+def _get(bucket, id_token, object_path):
+    url = requests.get(
+        _storage_url(bucket, object_path),
+        headers={"Authorization": "Firebase {}".format(id_token)},
+        timeout=_REQUEST_TIMEOUT,
+    )
+    return url
 
 
-def check_for_update():
+def _download_file(bucket, id_token, object_path, local_path):
+    resp = _get(bucket, id_token, object_path)
+    if resp.status_code != 200:
+        body = resp.text
+        resp.close()
+        raise RuntimeError("download {} failed: {} {}".format(
+            object_path, resp.status_code, body))
+    _ensure_parent_dirs(local_path)
     try:
-        set_update_status("checking", "Checking remote version...")
+        # Stream straight to disk in small pieces instead of resp.content,
+        # which buffers the whole file as one contiguous bytes object and
+        # blows up with "memory allocation failed" once the heap is
+        # fragmented (Wi-Fi buffers, HTTP server thread, relay/RTC objects
+        # all share the same ~264KB SRAM).
+        with open(local_path, "wb") as f:
+            while True:
+                chunk = resp.raw.read(_DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+                mem_diag.sample()
+                gc.collect()
+    finally:
+        resp.close()
 
-        raw = http_get(VERSION_URL)
-        remote_data = ujson.loads(raw.decode())
 
-        remote_version = remote_data.get("version", "0.0.0")
-        local_version = get_local_version()
+def check_for_update(bucket, id_token):
+    """
+    Check Firebase Storage for a newer firmware version and, if found,
+    download every file it lists to its on-device path.
 
-        if not is_newer(remote_version, local_version):
-            set_update_status("idle", "Already up to date at version {}".format(local_version))
+    Does NOT reset the board — the caller decides when it's safe to do so
+    (e.g. not mid-irrigation-cycle).
+
+    Returns True if a new version was downloaded (caller should reset once
+    safe), False if already up to date or the check failed.
+    """
+    resp = None
+    try:
+        _set_status("checking", "Checking for update...")
+        resp = _get(bucket, id_token, MANIFEST_PATH)
+        if resp.status_code != 200:
+            status_code = resp.status_code
+            _set_status("error", "manifest fetch failed: {} {}".format(
+                status_code, resp.text))
+            return False
+        manifest = resp.json()
+        resp.close()
+        resp = None
+        mem_diag.sample()
+        gc.collect()
+
+        remote_version = manifest.get("version", "0.0.0")
+        local_version  = get_local_version()
+
+        if not _is_newer(remote_version, local_version):
+            _set_status("idle", "Up to date at {}".format(local_version))
             return False
 
-        files = remote_data.get("files", [])
-        if not files:
-            raise RuntimeError("Remote version.json has no files list")
+        files   = manifest.get("files", [])
+        deletes = manifest.get("deletes", [])
+        if not files and not deletes:
+            _set_status("error", "manifest for {} has no files or deletes".format(remote_version))
+            return False
 
-        set_update_status("updating", "Updating from {} to {}".format(local_version, remote_version))
+        _set_status("updating", "Updating {} -> {}".format(local_version, remote_version))
+        for entry in files:
+            path = entry["path"]  # same relative path in Storage and on-device
+            _set_status("downloading", "Downloading {}".format(path))
+            _download_file(bucket, id_token, "ota/{}/{}".format(remote_version, path), path)
 
-        for file_info in files:
-            download_file(file_info)
+        for path in deletes:
+            _set_status("deleting", "Removing {}".format(path))
+            try:
+                os.remove(path)
+            except OSError:
+                pass  # already absent (fresh device, or already removed) -- fine either way
 
-        save_local_version(remote_version)
-        set_update_status("complete", "Updated successfully to version {}".format(remote_version))
-
-        utime.sleep(2)
-        machine.reset()
+        _save_local_version(remote_version)
+        _set_status("staged", "Downloaded {} — waiting for a safe moment to reboot".format(
+            remote_version))
         return True
 
     except Exception as ex:
-        set_update_status("error", str(ex))
-        raise
+        _set_status("error", str(ex))
+        return False
+    finally:
+        if resp is not None:
+            resp.close()
