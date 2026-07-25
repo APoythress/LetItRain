@@ -15,7 +15,7 @@ class StatusWriter:
         self._version = firmware_version
         self._name    = device_name
 
-    def push_ip(self, local_ip):
+    def push_ip(self, local_ip, reset_cause=None, boot_count=None, last_checkpoint=None):
         zones = self._config.get("zones", [])
         enabled_count = len([z for z in zones if z.get("enabled")])
         data = {
@@ -24,6 +24,15 @@ class StatusWriter:
             "device_name":      self._name,
             "zone_count":       enabled_count,
         }
+        # Only set at boot (see main.py) -- omitted on the periodic re-push
+        # so this PATCH doesn't keep re-sending an increasingly stale
+        # boot-time snapshot.
+        if reset_cause is not None:
+            data["last_reset_cause"] = reset_cause
+        if boot_count is not None:
+            data["boot_count"] = boot_count
+        if last_checkpoint is not None:
+            data["last_checkpoint"] = last_checkpoint.get("checkpoint")
         ok = self._fb.patch("meta", data)
         if ok:
             print("Firebase: meta pushed (ip={})".format(local_ip))
