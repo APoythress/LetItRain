@@ -85,6 +85,50 @@ def get_pending_slot(schedule, state, last_run_slots, now_epoch):
     return None, None
 
 
+def get_next_slot(schedule, last_run_slots, now_epoch):
+    """
+    Return the next upcoming enabled slot from now, looking up to 7 days
+    ahead -- for display only (e.g. the LCD's "next" field). Independent
+    of get_pending_slot(): this never decides whether to fire a run, just
+    what's coming up next.
+
+    Returns (day_name, hour, minute, zone_id), or None if no day has any
+    enabled slots at all.
+    """
+    now_tuple       = utime.localtime(now_epoch)
+    current_weekday = now_tuple[6]  # 0=Mon..6=Sun
+    current_hour    = now_tuple[3]
+    current_minute  = now_tuple[4]
+
+    best = None  # (day_offset, hour, minute, day_name, zone_id)
+
+    for offset in range(7):
+        weekday      = (current_weekday + offset) % 7
+        day_name     = DAY_NAMES[weekday]
+        day_schedule = schedule.get(day_name, {})
+        if not day_schedule.get("enabled", False):
+            continue
+
+        for i, slot in enumerate(day_schedule.get("slots", [])):
+            hour   = slot.get("start_hour", 0)
+            minute = slot.get("start_minute", 0)
+
+            if offset == 0:
+                if (hour, minute) < (current_hour, current_minute):
+                    continue  # already passed today
+                if _slot_key(day_name, i) in last_run_slots:
+                    continue  # already ran today
+
+            candidate = (offset, hour, minute)
+            if best is None or candidate < (best[0], best[1], best[2]):
+                best = (offset, hour, minute, day_name, slot.get("zone", 1))
+
+    if best is None:
+        return None
+    _, hour, minute, day_name, zone_id = best
+    return day_name, hour, minute, zone_id
+
+
 def clear_old_slot_runs(last_run_slots, now_epoch):
     """
     Purge slots from last_run_slots that were recorded yesterday or earlier.

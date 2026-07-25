@@ -1,5 +1,5 @@
 // Models/DeviceMeta.swift
-// Mirrors /devices/pico-zone-1/meta in Firebase.
+// Mirrors /devices/{device_id}/meta in Firebase.
 // The local_ip field is how the app knows which IP to probe for local mode.
 
 import Foundation

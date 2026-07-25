@@ -3,6 +3,7 @@
 # Updated for multi-zone: includes active_zone_id in status.
 
 from core.unix_time import unix_time
+from core import mem_diag
 
 
 class StatusWriter:
@@ -48,6 +49,8 @@ class StatusWriter:
             "active_skip":        active_skip,
             "active_skip_reason": active_skip_reason,
             "firmware_version":   self._version,
+            "free_mem_bytes":     mem_diag.sample(),
+            "min_free_mem_bytes": mem_diag.min_free(),
         }
         if not self._fb.patch("status", data):
             print("Firebase: status push failed (non-fatal)")

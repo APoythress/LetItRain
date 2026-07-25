@@ -1,5 +1,5 @@
 // Models/OTAStatus.swift
-// Mirrors /devices/pico-zone-1/update in Firebase.
+// Mirrors /devices/{device_id}/update in Firebase.
 import Foundation
 
 struct OTAStatus: Codable, Equatable {

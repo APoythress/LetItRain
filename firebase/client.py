@@ -12,6 +12,8 @@ import ujson
 import utime
 import gc
 
+from core import mem_diag
+
 try:
     import urequests as requests
 except ImportError:
@@ -43,6 +45,7 @@ class FirebaseClient:
         self._db_url       = db_url.rstrip("/")
         self._device_id    = device_id
         self._id_token     = None
+        self._uid          = None
         self._token_issued = 0   # utime.time() when token was obtained
 
     @property
@@ -51,6 +54,13 @@ class FirebaseClient:
         Exposed for other Firebase REST APIs (e.g. Cloud Storage) that need
         the same token but aren't part of the Realtime Database surface."""
         return self._id_token
+
+    @property
+    def uid(self):
+        """This account's Firebase Auth UID, or None if not authenticated
+        yet. Used to self-claim device_owner_uid at boot and for the
+        optional FIREBASE_EXPECTED_UID cross-check in secrets.py."""
+        return self._uid
 
     # ------------------------------------------------------------------
     # Authentication
@@ -81,6 +91,7 @@ class FirebaseClient:
 
             if "idToken" in data:
                 self._id_token     = data["idToken"]
+                self._uid          = data.get("localId")
                 self._token_issued = utime.time()
                 print("Firebase: authenticated OK")
                 return True
@@ -102,6 +113,7 @@ class FirebaseClient:
             # enough free memory in total, just not contiguously.
             if resp is not None:
                 resp.close()
+            mem_diag.sample()
             gc.collect()
 
     def _refresh_if_needed(self):
@@ -149,6 +161,7 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            mem_diag.sample()
             gc.collect()
 
     def patch(self, path, data_dict):
@@ -182,6 +195,7 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            mem_diag.sample()
             gc.collect()
 
     def put(self, path, value):
@@ -211,4 +225,5 @@ class FirebaseClient:
         finally:
             if resp is not None:
                 resp.close()
+            mem_diag.sample()
             gc.collect()

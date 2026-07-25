@@ -14,6 +14,8 @@ import ujson
 import usocket
 import gc
 
+from core import mem_diag
+
 
 def _json_response(conn, status_code, data_dict):
     body = ujson.dumps(data_dict)
@@ -35,6 +37,7 @@ def _json_response(conn, status_code, data_dict):
         conn.sendall(body.encode())
     finally:
         conn.close()
+    mem_diag.sample()
     gc.collect()
 
 
@@ -160,6 +163,8 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
                     "last_heartbeat":     now_fn(),
                     "firmware_version":   firmware_version,
                     "free_mem_bytes":     gc.mem_free(),
+                    "min_free_mem_bytes": mem_diag.min_free(),
+                    "heap_total_bytes":   mem_diag.heap_total(),
                 })
 
             elif method == "GET" and path == "/config":

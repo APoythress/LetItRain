@@ -7,6 +7,15 @@ import Combine
 import FirebaseDatabase
 import FirebaseAuth
 
+/// Thrown by any write attempted before `configure(deviceID:)` has run --
+/// should never happen in practice, since ContentView gates on
+/// AuthViewModel.deviceID before this repository is ever used, but this
+/// avoids silently writing to a "devices/nil/..." path if that gate is
+/// ever bypassed by a future change.
+enum FirebaseRepositoryError: Error {
+    case deviceNotConfigured
+}
+
 @MainActor
 final class FirebaseRepository: ObservableObject {
 
@@ -15,7 +24,11 @@ final class FirebaseRepository: ObservableObject {
     @Published var config:    DeviceConfig? = nil
     @Published var otaStatus: OTAStatus     = .idle
 
-    private let devicePath = "devices/pico-zone-1"
+    /// Set once via configure(deviceID:), after AuthViewModel resolves which
+    /// device this signed-in user's account controls (users/{uid}/device_id).
+    /// Was a hardcoded "devices/pico-zone-1" constant; now per-user so one
+    /// Firebase project can host multiple people's devices.
+    private var devicePath: String?
     private var handles: [DatabaseHandle] = []
     private let db = Database.database().reference()
 
@@ -25,9 +38,17 @@ final class FirebaseRepository: ObservableObject {
         return d
     }()
 
+    func configure(deviceID: String) {
+        devicePath = "devices/\(deviceID)"
+    }
+
     // MARK: - Listeners
 
     func startListening() {
+        guard let devicePath else {
+            assertionFailure("FirebaseRepository.startListening() called before configure(deviceID:)")
+            return
+        }
         // Status
         let sh = db.child("\(devicePath)/status").observe(.value) { [weak self] snap in
             guard let self, let dict = snap.value as? [String: Any] else { return }
@@ -72,6 +93,21 @@ final class FirebaseRepository: ObservableObject {
     func stopListening() {
         handles.forEach { db.removeObserver(withHandle: $0) }
         handles = []
+    }
+
+    /// Tears down listeners and clears the resolved device -- call on
+    /// sign-out. Without this, a sign-out/sign-in cycle within the same
+    /// app session (e.g. a household switching between two people's
+    /// devices) would leave the previous user's listeners attached
+    /// indefinitely, alongside the newly signed-in user's, both writing
+    /// into the same @Published properties.
+    func reset() {
+        stopListening()
+        devicePath = nil
+        status     = .placeholder
+        meta       = nil
+        config     = nil
+        otaStatus  = .idle
     }
 
     // MARK: - Snapshot merging
@@ -134,6 +170,7 @@ final class FirebaseRepository: ObservableObject {
 
     /// Write entire schedule + zones to Firebase. Called from ScheduleViewModel on save.
     func writeConfig(_ config: DeviceConfig) async throws {
+        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
         // Zones
         var zonesDict: [String: Any] = [:]
         for z in config.zones {
@@ -161,6 +198,7 @@ final class FirebaseRepository: ObservableObject {
 
     /// Skip-today override.
     func writeSkipToday(reason: String = "manual_remote") async throws {
+        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
         let dateStr = todayDateString()
         try await db.child("\(devicePath)/overrides").setValue([
             "skip_today":      true,
@@ -172,6 +210,7 @@ final class FirebaseRepository: ObservableObject {
     }
 
     func cancelSkip() async throws {
+        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
         try await db.child("\(devicePath)/overrides").updateChildValues([
             "skip_today":  false,
             "skip_date":   NSNull(),
@@ -184,6 +223,7 @@ final class FirebaseRepository: ObservableObject {
     /// Ask the Pico to check for a firmware update right now instead of waiting
     /// for its periodic timer. The Pico clears `requested` as soon as it sees it.
     func requestUpdateCheck() async throws {
+        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
         try await db.child("\(devicePath)/update").updateChildValues(["requested": true])
     }
 

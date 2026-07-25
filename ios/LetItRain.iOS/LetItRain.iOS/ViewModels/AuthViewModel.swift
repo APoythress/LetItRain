@@ -5,13 +5,16 @@
 import Foundation
 import Combine
 import FirebaseAuth
+import FirebaseDatabase
 
 @MainActor
 final class AuthViewModel: ObservableObject {
 
-    @Published var isSignedIn:    Bool    = false
-    @Published var isLoading:     Bool    = false
-    @Published var errorMessage:  String? = nil
+    @Published var isSignedIn:        Bool    = false
+    @Published var isLoading:         Bool    = false
+    @Published var errorMessage:      String? = nil
+    @Published var deviceID:          String? = nil
+    @Published var isResolvingDevice: Bool    = false
 
     private var authListener: AuthStateDidChangeListenerHandle?
 
@@ -30,8 +33,37 @@ final class AuthViewModel: ObservableObject {
     func checkAuthState() {
         authListener = Auth.auth().addStateDidChangeListener { [weak self] _, user in
             Task { @MainActor [weak self] in
-                self?.isSignedIn = user != nil
+                guard let self else { return }
+                self.isSignedIn = user != nil
+                if let user {
+                    await self.resolveDeviceID(for: user.uid)
+                } else {
+                    self.deviceID = nil
+                    self.isResolvingDevice = false
+                }
             }
+        }
+    }
+
+    // MARK: - Device resolution
+
+    /// Looks up users/{uid}/device_id -- which physical device this signed-in
+    /// person's account is allowed to control. Admin-assigned only (the
+    /// security rules make this field read-only from the app); see README's
+    /// "Onboarding a new device" section for how it gets set.
+    private func resolveDeviceID(for uid: String) async {
+        isResolvingDevice = true
+        defer { isResolvingDevice = false }
+        do {
+            let snap = try await Database.database().reference()
+                .child("users/\(uid)/device_id")
+                .getData()
+            deviceID = snap.value as? String
+            if deviceID == nil {
+                errorMessage = "Your account isn't assigned to a device yet. Contact whoever set up this project."
+            }
+        } catch {
+            errorMessage = "Couldn't determine your device: \(error.localizedDescription)"
         }
     }
 
@@ -62,7 +94,9 @@ final class AuthViewModel: ObservableObject {
     func signOut() {
         do {
             try Auth.auth().signOut()
-            isSignedIn = false
+            isSignedIn        = false
+            deviceID          = nil
+            isResolvingDevice = false
         } catch {
             errorMessage = "Sign out failed: \(error.localizedDescription)"
         }

@@ -2,10 +2,17 @@
 # Over-the-air firmware updates via Firebase Cloud Storage.
 #
 # Flow:
-#   1. Download ota/manifest.json from Storage: {"version": "1.3.0", "files": [{"path": "main.py"}, ...]}
+#   1. Download ota/manifest.json from Storage:
+#      {"version": "1.3.0", "files": [{"path": "main.py"}, ...], "deletes": ["old/file.py"]}
 #   2. Compare manifest version to local version.json
 #   3. If newer, download every listed file from ota/{version}/{path} to its
-#      on-device path, then overwrite local version.json.
+#      on-device path, remove every path listed in "deletes", then overwrite
+#      local version.json.
+#
+# "deletes" exists because "files" can only ever add or overwrite -- there is
+# nothing to download for a file that should stop existing, so removing an
+# entry from "files" does not remove it from already-updated devices. Add its
+# path to "deletes" instead.
 #
 # This module only ever reads from Storage — updates are published by
 # uploading new files to the bucket yourself (Firebase Console or gsutil),
@@ -18,6 +25,8 @@
 import ujson
 import os
 import gc
+
+from core import mem_diag
 
 try:
     import urequests as requests
@@ -119,6 +128,7 @@ def _download_file(bucket, id_token, object_path, local_path):
                 if not chunk:
                     break
                 f.write(chunk)
+                mem_diag.sample()
                 gc.collect()
     finally:
         resp.close()
@@ -147,6 +157,7 @@ def check_for_update(bucket, id_token):
         manifest = resp.json()
         resp.close()
         resp = None
+        mem_diag.sample()
         gc.collect()
 
         remote_version = manifest.get("version", "0.0.0")
@@ -156,9 +167,10 @@ def check_for_update(bucket, id_token):
             _set_status("idle", "Up to date at {}".format(local_version))
             return False
 
-        files = manifest.get("files", [])
-        if not files:
-            _set_status("error", "manifest for {} has no files".format(remote_version))
+        files   = manifest.get("files", [])
+        deletes = manifest.get("deletes", [])
+        if not files and not deletes:
+            _set_status("error", "manifest for {} has no files or deletes".format(remote_version))
             return False
 
         _set_status("updating", "Updating {} -> {}".format(local_version, remote_version))
@@ -166,6 +178,13 @@ def check_for_update(bucket, id_token):
             path = entry["path"]  # same relative path in Storage and on-device
             _set_status("downloading", "Downloading {}".format(path))
             _download_file(bucket, id_token, "ota/{}/{}".format(remote_version, path), path)
+
+        for path in deletes:
+            _set_status("deleting", "Removing {}".format(path))
+            try:
+                os.remove(path)
+            except OSError:
+                pass  # already absent (fresh device, or already removed) -- fine either way
 
         _save_local_version(remote_version)
         _set_status("staged", "Downloaded {} — waiting for a safe moment to reboot".format(
