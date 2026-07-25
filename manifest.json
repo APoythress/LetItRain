@@ -1,5 +1,5 @@
 {
-  "version": "1.2.18",
+  "version": "1.2.19",
   "files": [
     { "path": "main.py" },
     { "path": "firebase/status_writer.py" }

@@ -362,9 +362,14 @@ def main():
     # physical/serial access can still be checked for a reset loop.
     boot_reset_cause = _reset_cause_name()
     boot_count       = _next_boot_count()
+    # TEMPORARY diagnostic for the CYW43 hang investigation -- remove once
+    # we've confirmed which MicroPython build is on this board and whether
+    # updating it changes anything.
+    mpy_version = os.uname().version
 
     print("LetItRain v{} booting...".format(firmware_version))
     print("Boot #{}, reset cause: {}".format(boot_count, boot_reset_cause))
+    print("MicroPython:", mpy_version)
     print("Zones configured:", relay.zone_ids())
 
     # --- Wi-Fi ---
@@ -538,7 +543,8 @@ def main():
         try:
             status_writer.push_ip(local_ip, reset_cause=boot_reset_cause,
                                   boot_count=boot_count,
-                                  last_checkpoint=last_checkpoint)
+                                  last_checkpoint=last_checkpoint,
+                                  mpy_version=mpy_version)
         except Exception as ex:
             print("Firebase push_ip failed (non-fatal):", ex)
         wdt.feed()

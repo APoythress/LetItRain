@@ -15,7 +15,8 @@ class StatusWriter:
         self._version = firmware_version
         self._name    = device_name
 
-    def push_ip(self, local_ip, reset_cause=None, boot_count=None, last_checkpoint=None):
+    def push_ip(self, local_ip, reset_cause=None, boot_count=None,
+                last_checkpoint=None, mpy_version=None):
         zones = self._config.get("zones", [])
         enabled_count = len([z for z in zones if z.get("enabled")])
         data = {
@@ -33,6 +34,8 @@ class StatusWriter:
             data["boot_count"] = boot_count
         if last_checkpoint is not None:
             data["last_checkpoint"] = last_checkpoint.get("checkpoint")
+        if mpy_version is not None:
+            data["mpy_version"] = mpy_version
         ok = self._fb.patch("meta", data)
         if ok:
             print("Firebase: meta pushed (ip={})".format(local_ip))
