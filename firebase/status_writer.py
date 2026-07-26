@@ -45,7 +45,7 @@ class StatusWriter:
             "last_run_zone_id":   last.get("zone_id"),
             "last_run_status":    last.get("status"),
             "device_online":      True,
-            "last_heartbeat":     unix_time(),
+            "last_synced_epoch":  unix_time(),
             "active_skip":        active_skip,
             "active_skip_reason": active_skip_reason,
             "firmware_version":   self._version,
@@ -57,24 +57,24 @@ class StatusWriter:
 
     def push_last_run(self, start_epoch, end_epoch, mode, zone_id, status_str):
         data = {
-            "last_run_start":   start_epoch,
-            "last_run_end":     end_epoch,
-            "last_run_mode":    mode,
-            "last_run_zone_id": zone_id,
-            "last_run_status":  status_str,
-            "is_running":       False,
-            "active_zone_id":   None,
-            "current_mode":     "idle",
-            "run_started_at":   None,
-            "run_ends_at":      None,
-            "last_heartbeat":   unix_time(),
+            "last_run_start":    start_epoch,
+            "last_run_end":      end_epoch,
+            "last_run_mode":     mode,
+            "last_run_zone_id":  zone_id,
+            "last_run_status":   status_str,
+            "is_running":        False,
+            "active_zone_id":    None,
+            "current_mode":      "idle",
+            "run_started_at":    None,
+            "run_ends_at":       None,
+            "last_synced_epoch": unix_time(),
         }
         if not self._fb.patch("status", data):
             print("Firebase: push_last_run failed (non-fatal)")
 
     def push_offline(self):
         self._fb.patch("status", {
-            "device_online":  False,
-            "last_heartbeat": unix_time(),
+            "device_online":     False,
+            "last_synced_epoch": unix_time(),
         })
         print("Firebase: device marked offline")

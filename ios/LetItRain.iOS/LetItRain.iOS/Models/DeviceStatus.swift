@@ -13,19 +13,19 @@ struct DeviceStatus: Codable {
     var lastRunZoneId:     Int?
     var lastRunStatus:     String?
     var deviceOnline:      Bool
-    var lastHeartbeat:     TimeInterval
+    var lastSyncedEpoch:   TimeInterval
     var activeSkip:        Bool
     var activeSkipReason:  String?
     var firmwareVersion:   String?
 
     var isRecentlyOnline: Bool {
-        // Heartbeat interval is 30s (relaxed from 15s to ease load on the
-        // Pico), and the app's own tolerance for staleness is 30-45s, so
-        // this needs real margin over 30s rather than being tight against
-        // it. 90s (3x the heartbeat) absorbs normal jitter from the Pico's
-        // single-threaded loop without flickering "offline" during a
-        // temporarily slow (but not actually dead) cycle.
-        Date().timeIntervalSince1970 - lastHeartbeat < 90
+        // Local polling refreshes this every 30s, so staleness there is
+        // never more than a poll or two. Remotely, the Pico only syncs to
+        // Firebase once an hour (CLOUD_SYNC_INTERVAL in main.py) -- kept
+        // deliberately infrequent so it doesn't wedge the Pico W's WiFi
+        // chip with constant TLS traffic. 2x that (2h) absorbs a missed or
+        // late cycle without flickering "offline" between normal syncs.
+        Date().timeIntervalSince1970 - lastSyncedEpoch < 7200
     }
 
     var remainingSeconds: TimeInterval? {
@@ -49,7 +49,7 @@ struct DeviceStatus: Codable {
                      runStartedAt: nil, runEndsAt: nil,
                      lastRunStart: nil, lastRunEnd: nil,
                      lastRunMode: nil, lastRunZoneId: nil, lastRunStatus: nil,
-                     deviceOnline: false, lastHeartbeat: 0,
+                     deviceOnline: false, lastSyncedEpoch: 0,
                      activeSkip: false, activeSkipReason: nil, firmwareVersion: nil)
     }
 }

@@ -1,11 +1,11 @@
 // ViewModels/FirebaseRepository.swift
-// Reads status, meta, zones, and schedule from Firebase.
-// Writes overrides (skip-today) and schedule/zone config.
+// Reads status, meta, zones, and schedule from Firebase (zones/schedule are
+// read-only here -- the app never writes them; see DeviceViewModel).
+// Writes: skip-for-N-days override, and the OTA "check now" request flag.
 
 import Foundation
 import Combine
 import FirebaseDatabase
-import FirebaseAuth
 
 /// Thrown by any write attempted before `configure(deviceID:)` has run --
 /// should never happen in practice, since ContentView gates on
@@ -167,42 +167,20 @@ final class FirebaseRepository: ObservableObject {
     }
 
     // MARK: - Writes
+    //
+    // Schedule/zone config is intentionally not writable here -- the app is
+    // local-only for that (see DeviceViewModel.wireScheduleVM), and the
+    // Firebase security rules enforce it too (zones/schedule .write is
+    // owner-uid/Pico-only now, see root README).
 
-    /// Write entire schedule + zones to Firebase. Called from ScheduleViewModel on save.
-    func writeConfig(_ config: DeviceConfig) async throws {
+    /// Skip the schedule for `days` days, starting today (inclusive) -- the
+    /// out-of-town use case. `days: 1` behaves like the old single-day skip.
+    func writeSkip(days: Int, reason: String = "manual_remote") async throws {
         guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
-        // Zones
-        var zonesDict: [String: Any] = [:]
-        for z in config.zones {
-            zonesDict["\(z.id)"] = ["name": z.name, "pin": z.pin, "enabled": z.enabled]
-        }
-        try await db.child("\(devicePath)/zones").setValue(zonesDict)
-
-        // Schedule
-        var scheduleDict: [String: Any] = [:]
-        for day in Weekday.allCases {
-            let d     = config.schedule[day]
-            var slots: [String: Any] = [:]
-            for (i, slot) in d.slots.enumerated() {
-                slots["\(i)"] = [
-                    "zone":               slot.zone,
-                    "start_hour":         slot.startHour,
-                    "start_minute":       slot.startMinute,
-                    "duration_minutes":   slot.durationMinutes,
-                ]
-            }
-            scheduleDict[day.rawValue] = ["enabled": d.enabled, "slots": slots]
-        }
-        try await db.child("\(devicePath)/schedule").setValue(scheduleDict)
-    }
-
-    /// Skip-today override.
-    func writeSkipToday(reason: String = "manual_remote") async throws {
-        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
-        let dateStr = todayDateString()
+        let until = dateString(daysFromToday: max(0, days - 1))
         try await db.child("\(devicePath)/overrides").setValue([
-            "skip_today":      true,
-            "skip_date":       dateStr,
+            "skip_active":     true,
+            "skip_until":      until,
             "skip_reason":     reason,
             "override_set_at": ServerValue.timestamp(),
             "override_set_by": "app_remote",
@@ -212,8 +190,8 @@ final class FirebaseRepository: ObservableObject {
     func cancelSkip() async throws {
         guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
         try await db.child("\(devicePath)/overrides").updateChildValues([
-            "skip_today":  false,
-            "skip_date":   NSNull(),
+            "skip_active": false,
+            "skip_until":  NSNull(),
             "skip_reason": NSNull(),
         ] as [String: Any])
     }
@@ -227,13 +205,6 @@ final class FirebaseRepository: ObservableObject {
         try await db.child("\(devicePath)/update").updateChildValues(["requested": true])
     }
 
-    // MARK: - FCM token
-
-    func storeFCMToken(_ token: String) {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        db.child("users/\(uid)/fcm_token").setValue(token)
-    }
-
     func currentMeta() async -> DeviceMeta? { meta }
 
     // MARK: - Helpers
@@ -243,8 +214,9 @@ final class FirebaseRepository: ObservableObject {
         return try? decoder.decode(type, from: data)
     }
 
-    private func todayDateString() -> String {
+    private func dateString(daysFromToday days: Int) -> String {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = .current
-        return f.string(from: Date())
+        let date = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
+        return f.string(from: date)
     }
 }

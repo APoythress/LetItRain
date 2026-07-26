@@ -48,25 +48,12 @@ Make sure "Add to target: LetItRain" is checked for all files.
 3. Add these products:
    - `FirebaseAuth`
    - `FirebaseDatabase`
-   - `FirebaseMessaging`
 4. Target: LetItRain
 
-### 5. Add Capabilities
-In Xcode → Target → Signing & Capabilities → + Capability:
-- **Push Notifications**
-- **Background Modes** → check "Remote notifications"
-
-### 6. Upload APNs Key to Firebase
-1. Apple Developer Portal → Certificates, IDs & Profiles → Keys → Create new key
-2. Check "Apple Push Notifications service (APNs)"
-3. Download the .p8 file (you only get one chance)
-4. Firebase Console → Project Settings → Cloud Messaging → Apple app configuration
-5. Upload the .p8 file, enter the Key ID and Team ID
-
-### 7. Set Signing Team
+### 5. Set Signing Team
 Xcode → Target → Signing & Capabilities → Team → select your Apple Developer account
 
-### 8. Build & Run
+### 6. Build & Run
 - Select a simulator or your physical iPhone
 - Build with Cmd+B to check for errors
 - Run with Cmd+R
@@ -74,8 +61,12 @@ Xcode → Target → Signing & Capabilities → Team → select your Apple Devel
 ## First Run
 1. Sign in with the email/password you created in Firebase Authentication
 2. The app will be in Remote mode until you're on the same Wi-Fi as the Pico
-3. In Remote mode: status is read-only, skip-today is available
+3. In Remote mode: status is read-only (last run, last synced), and you can skip the schedule for N days — useful when out of town
 4. In Local mode: full control — start, stop, schedule configuration
+
+The app is local-only for all control (manual start/stop, schedule editing) --
+Remote mode never writes schedule/zone config, both in the app's own logic and
+in the Firebase security rules (see root README).
 
 ## App Store Submission Checklist
 - [ ] App icon added to Assets.xcassets (1024×1024 PNG, no alpha)

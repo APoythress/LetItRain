@@ -9,6 +9,8 @@
 #   POST /config          → replace config (zones + schedule)
 #   POST /skip-today      → set local skip override
 #   POST /cancel-skip     → clear local skip override
+#   POST /check-update    → trigger an immediate OTA check (bypasses the
+#                           hourly cloud-sync pass main.py otherwise waits for)
 
 import ujson
 import usocket
@@ -120,7 +122,8 @@ def _parse_request(raw):
 
 
 def run_server(config, state, rtc, on_manual_start, on_manual_stop,
-               local_override, save_config_fn, now_fn, firmware_version):
+               local_override, local_update_trigger, save_config_fn, now_fn,
+               firmware_version):
     addr = usocket.getaddrinfo("0.0.0.0", 80)[0][-1]
     server = usocket.socket()
     server.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
@@ -160,7 +163,7 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
                     "active_skip":        local_override["skip_today"],
                     "active_skip_reason": local_override["skip_reason"],
                     "device_online":      True,
-                    "last_heartbeat":     now_fn(),
+                    "last_synced_epoch":  now_fn(),
                     "firmware_version":   firmware_version,
                     "free_mem_bytes":     gc.mem_free(),
                     "min_free_mem_bytes": mem_diag.min_free(),
@@ -201,6 +204,10 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
                 local_override["skip_today"]  = False
                 local_override["skip_reason"] = None
                 _json_response(conn, 200, {"skipped": False})
+
+            elif method == "POST" and path == "/check-update":
+                local_update_trigger["requested"] = True
+                _json_response(conn, 200, {"requested": True})
 
             else:
                 _json_response(conn, 405, {"error": "not found", "path": path})

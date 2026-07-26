@@ -4,6 +4,12 @@
 import Foundation
 import Combine
 
+/// Thrown by any action that requires local Wi-Fi (schedule save, manual
+/// start/stop) when attempted without a local connection.
+private struct LocalOnlyError: LocalizedError {
+    var errorDescription: String? { "Requires local Wi-Fi connection." }
+}
+
 @MainActor
 final class DeviceViewModel: ObservableObject {
 
@@ -97,15 +103,20 @@ final class DeviceViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    // Schedule editing is local-only -- there is no remote-write fallback
+    // here on purpose (see root README's Firebase rules note: zones/schedule
+    // .write is owner-uid/Pico-only now, so a remote write would be
+    // rejected by the rules even if attempted). ScheduleView is only ever
+    // shown while connectionManager.mode.isLocal (see HomeView), so the
+    // no-client branch below should never actually fire in practice; it's
+    // a clear error rather than a silent no-op if it somehow does.
     private func wireScheduleVM() {
         scheduleVM.onSave = { [weak self] updatedConfig in
-            guard let self else { return }
-            if let client = self.localClient {
-                try await client.updateConfig(updatedConfig)
-                self.config = updatedConfig
-            } else {
-                try await self.firebaseRepository.writeConfig(updatedConfig)
+            guard let self, let client = self.localClient else {
+                throw LocalOnlyError()
             }
+            try await client.updateConfig(updatedConfig)
+            self.config = updatedConfig
         }
     }
 
@@ -189,17 +200,35 @@ final class DeviceViewModel: ObservableObject {
         }
     }
 
+    /// Local-only instant skip. Remote uses `skipForDays(_:)` instead, since
+    /// "skip today" alone isn't useful when you won't be back to check the
+    /// app again before tomorrow's run.
     func skipToday() {
+        guard let client = localClient else {
+            errorMessage = "Requires local Wi-Fi connection."
+            return
+        }
         Task {
             isLoading = true
             do {
-                if let client = localClient {
-                    try await client.sendSkipToday()
-                    await refreshLocal()
-                } else {
-                    try await firebaseRepository.writeSkipToday()
-                }
+                try await client.sendSkipToday()
+                await refreshLocal()
                 successMessage = "Today's scheduled run will be skipped."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    /// Remote-only: skip the schedule for the next `days` days (inclusive of
+    /// today) -- the out-of-town use case.
+    func skipForDays(_ days: Int) {
+        Task {
+            isLoading = true
+            do {
+                try await firebaseRepository.writeSkip(days: days)
+                successMessage = days <= 1
+                    ? "Today's scheduled run will be skipped."
+                    : "Schedule skipped for \(days) days."
             } catch { handleError(error) }
             isLoading = false
         }

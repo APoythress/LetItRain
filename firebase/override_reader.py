@@ -1,6 +1,9 @@
 # firebase/override_reader.py
 # Reads the overrides node from Firebase to determine if today's
-# scheduled run should be skipped.
+# scheduled run should be skipped. Backs the remote "skip for N days"
+# feature -- a range (skip_active + inclusive skip_until date), not just
+# a single day, since that's the whole point of setting it while out of
+# town instead of re-opening the app every morning.
 #
 # Called only when the scheduler is about to fire a run — not on
 # every main loop iteration — to minimise Firebase reads.
@@ -52,13 +55,16 @@ class OverrideReader:
             # Firebase read failed or node doesn't exist yet
             return False, None
 
-        skip_today = data.get("skip_today", False)
-        if not skip_today:
+        skip_active = data.get("skip_active", False)
+        if not skip_active:
             return False, None
 
-        skip_date = data.get("skip_date")
-        if skip_date != today_date_string:
-            # Skip was set for a different date — treat as expired
+        skip_until = data.get("skip_until")
+        # skip_until is an inclusive "YYYY-MM-DD" end date -- ISO date
+        # strings sort correctly under plain string comparison, so this
+        # needs no date-math library on MicroPython. Missing/malformed
+        # skip_until is treated as already expired (fail toward watering).
+        if not skip_until or today_date_string > skip_until:
             return False, None
 
         skip_reason = data.get("skip_reason", "unknown")
@@ -75,5 +81,6 @@ class OverrideReader:
         #         return False, None
         # ----------------------------------------------------------------
 
-        print("OverrideReader: skip active — reason:", skip_reason)
+        print("OverrideReader: skip active until {} — reason: {}".format(
+            skip_until, skip_reason))
         return True, skip_reason

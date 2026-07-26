@@ -5,9 +5,9 @@
 #   - Multi-zone relay control (up to 5 zones, configurable GPIO pins)
 #   - Multi-slot scheduler: multiple start times per day, per zone
 #   - HTTP JSON API for local iOS control
-#   - Firebase writer: status heartbeat + meta (IP, zone count)
-#   - Firebase reader: schedule + zone config sync every 60s
-#   - Firebase override reader: skip-today support
+#   - Firebase writer: status + meta (IP, zone count), batched once/hour
+#   - Firebase reader: schedule + zone config, batched once/hour
+#   - Firebase override reader: skip-for-N-days support (remote only)
 
 import utime
 import gc
@@ -204,6 +204,10 @@ def on_manual_stop():
 
 local_override = {"skip_today": False, "skip_reason": None}
 
+# Set by web/server.py's /check-update endpoint so a local LAN user gets an
+# instant OTA check instead of waiting for the hourly cloud-sync pass.
+local_update_trigger = {"requested": False}
+
 # ---------------------------------------------------------------------------
 # HTTP server thread
 # ---------------------------------------------------------------------------
@@ -217,6 +221,7 @@ def start_web_server():
             on_manual_start=on_manual_start,
             on_manual_stop=on_manual_stop,
             local_override=local_override,
+            local_update_trigger=local_update_trigger,
             save_config_fn=save_config,
             now_fn=get_now_epoch,
             firmware_version=firmware_version,
@@ -405,34 +410,34 @@ def main():
     wdt.feed()
 
     # --- Timing ---
-    last_status_push  = 0
-    last_schedule_sync = 0
-    last_ip_push       = utime.time()
-    last_update_check  = utime.time()
-    last_ota_poll      = utime.time()
-    last_ota_status_pushed = None
-    # Relaxed from the original 15/60/30s: the app tolerates 30-45s of
-    # staleness on everything, and every one of these is a Firebase/TLS
-    # round-trip competing for this board's limited RAM -- halving the call
-    # rate directly eases that pressure, not just a latency trade-off.
-    STATUS_INTERVAL   = 30
-    SYNC_INTERVAL     = 90
-    IP_PUSH_INTERVAL  = 300  # re-check/re-push local_ip every 5 min
-    OTA_POLL_INTERVAL = 45   # manual "check now" trigger + status push
+    last_cloud_sync         = 0
+    last_ota_status_pushed  = None
+    # Remote monitoring no longer needs to be near-real-time -- the iOS app
+    # is local-only for all control, and remote is just an occasional glance
+    # at last-run info plus a skip-for-N-days override. The previous four
+    # independent timers (status/schedule/IP/OTA-poll, each 30-300s) meant
+    # this board was doing a TLS handshake every 15-20s combined at idle,
+    # which is what wedges the Pico W's CYW43 WiFi chip. Collapsed into one
+    # batched pass on a single relaxed clock: status, IP, schedule pull, and
+    # OTA-trigger check all fire together once an hour instead of on their
+    # own clocks all day. Run-completion data isn't delayed by this --
+    # push_last_run() (see stop_run()) still fires immediately and
+    # separately the moment a run actually ends.
+    CLOUD_SYNC_INTERVAL = 3600
 
     # wdt was already armed right after Wi-Fi settled, above -- from here
-    # on it's fed after each section below (heartbeat, OTA poll, IP check,
-    # schedule sync, ...) and every 100ms in the LED-tick loop, not wrapped
-    # around any single blocking call. Each Firebase call has its own ~8s
-    # internal timeout, and several can legitimately fire in the same pass,
-    # so feeding only once per full iteration could stack those timeouts
-    # past 8s during an ordinary internet outage and false-trigger. Feeding
-    # between sections means only a call that never returns at all (I2C
-    # contention, a wedged Wi-Fi driver, memory exhaustion, whatever the
-    # next lockup turns out to be) goes unfed long enough to reset.
-    # relay.all_off() is unconditionally the first thing that runs on every
-    # boot, so this guarantees water stops within seconds of any such hang,
-    # even one we never manage to root-cause.
+    # on it's fed after each section below (cloud sync, ...) and every 100ms
+    # in the LED-tick loop, not wrapped around any single blocking call.
+    # Each Firebase call has its own ~8s internal timeout, and several can
+    # legitimately fire in the same pass, so feeding only once per full
+    # iteration could stack those timeouts past 8s during an ordinary
+    # internet outage and false-trigger. Feeding between sections means only
+    # a call that never returns at all (I2C contention, a wedged Wi-Fi
+    # driver, memory exhaustion, whatever the next lockup turns out to be)
+    # goes unfed long enough to reset. relay.all_off() is unconditionally
+    # the first thing that runs on every boot, so this guarantees water
+    # stops within seconds of any such hang, even one we never manage to
+    # root-cause.
 
     # Baseline heap reading -- the arena size is fixed at boot on
     # MicroPython, so this total is the real RAM ceiling to compare
@@ -513,29 +518,80 @@ def main():
                             start_run(zone_id, duration_seconds, "scheduled")
                             last_run_slots[slot_key] = local_epoch
 
-                # --- Firebase heartbeat ---
-                # Kept to a single request: this loop is single-threaded, so
-                # anything else stacked here directly delays how often this
-                # specific call can land, and it's the one the app's
-                # "device online" freshness check depends on.
-                if utime.time() - last_status_push >= STATUS_INTERVAL:
+                # --- Local "check for update now" trigger ---
+                # Separate from the batched cloud-sync pass below and not
+                # gated on its hourly clock, so tapping "Check for Update"
+                # while on the LAN still feels instant instead of waiting
+                # up to an hour.
+                if (local_update_trigger["requested"] and not state.is_running()
+                        and not update_pending):
+                    local_update_trigger["requested"] = False
+                    if fb.id_token:
+                        try:
+                            if lcd_status:
+                                lcd_status.show_message("Updating")
+                            update_pending = check_for_update(FIREBASE_STORAGE_BUCKET, fb.id_token)
+                        except Exception as ex:
+                            print("Local OTA check failed (non-fatal):", ex)
+                        wdt.feed()
+
+                # --- Cloud sync: status, IP, schedule, OTA -- all batched ---
+                # Collapsed from four independent timers into one pass, and
+                # skipped entirely while a zone is running (same reasoning
+                # as elsewhere in this file: nothing here is urgent enough to
+                # justify TLS traffic during the one window that most needs
+                # the radio left alone). Remote status freshness is a
+                # once-an-hour concern now, not a 30s one -- see the timing
+                # comment above.
+                if not state.is_running() and utime.time() - last_cloud_sync >= CLOUD_SYNC_INTERVAL:
+                    # Resolve skip state from both sources -- local (this
+                    # boot's in-memory override) and remote (Firebase
+                    # overrides, e.g. a skip-for-N-days set while out of
+                    # town) -- so the app's own status view reflects a
+                    # remote skip within one sync pass instead of never
+                    # (the scheduler's own override read, right when a slot
+                    # is about to fire below, is the one that actually gates
+                    # whether a run happens; this is purely for display).
+                    skip_active = local_override["skip_today"]
+                    skip_reason = local_override["skip_reason"]
+                    if not skip_active:
+                        try:
+                            skip_active, skip_reason = override_reader.get_active_skip(now_date_string)
+                        except Exception as ex:
+                            print("Override read for status display failed (non-fatal):", ex)
+
                     try:
                         status_writer.push_status(
-                            active_skip=local_override["skip_today"],
-                            active_skip_reason=local_override["skip_reason"],
+                            active_skip=skip_active,
+                            active_skip_reason=skip_reason,
                         )
                         status_led.set_mode("running")
                     except Exception as ex:
-                        print("Firebase heartbeat failed (non-fatal):", ex)
+                        print("Firebase status push failed (non-fatal):", ex)
                         status_led.set_mode("no_internet")
-                    last_status_push = utime.time()
-                    wdt.feed()
 
-                # --- Manual OTA trigger + status push ---
-                # Own interval, separate from the heartbeat above, so a
-                # pending "check now" from the app doesn't add extra
-                # round-trips to the time-sensitive online/offline signal.
-                if utime.time() - last_ota_poll >= OTA_POLL_INTERVAL:
+                    if wlan is not None and wlan.isconnected():
+                        try:
+                            current_ip = wlan.ifconfig()[0]
+                            # Never adopt/push "0.0.0.0" — ifconfig() can read
+                            # that transiently during a DHCP lease renewal,
+                            # and pushing it would overwrite a known-good IP
+                            # in Firebase with a value the app treats as
+                            # invalid until the next sync.
+                            if current_ip != "0.0.0.0" and current_ip != local_ip:
+                                local_ip = current_ip
+                            if local_ip != "0.0.0.0":
+                                status_writer.push_ip(local_ip)
+                        except Exception as ex:
+                            print("Firebase push_ip failed (non-fatal):", ex)
+
+                    try:
+                        schedule_sync.sync()
+                        # If zones changed, re-init relay controller would need reboot
+                        # For now: log a note; zone hardware changes require reboot
+                    except Exception as ex:
+                        print("Schedule sync failed (non-fatal):", ex)
+
                     if not update_pending and fb.id_token:
                         try:
                             update_info = fb.get("update") or {}
@@ -559,40 +615,7 @@ def main():
                         except Exception:
                             pass
 
-                    last_ota_poll = utime.time()
-                    wdt.feed()
-
-                # --- Local IP re-check ---
-                # Catches DHCP lease renewals / router reboots that hand the
-                # Pico a new address after boot, so meta/local_ip in Firebase
-                # never goes stale for longer than IP_PUSH_INTERVAL.
-                if utime.time() - last_ip_push >= IP_PUSH_INTERVAL:
-                    if wlan is not None and wlan.isconnected():
-                        try:
-                            current_ip = wlan.ifconfig()[0]
-                            # Never adopt/push "0.0.0.0" — ifconfig() can read
-                            # that transiently during a DHCP lease renewal,
-                            # and pushing it would overwrite a known-good IP
-                            # in Firebase with a value the app treats as
-                            # invalid until the next 5-minute cycle.
-                            if current_ip != "0.0.0.0" and current_ip != local_ip:
-                                local_ip = current_ip
-                            if local_ip != "0.0.0.0":
-                                status_writer.push_ip(local_ip)
-                        except Exception as ex:
-                            print("Firebase push_ip failed (non-fatal):", ex)
-                    last_ip_push = utime.time()
-                    wdt.feed()
-
-                # --- Schedule sync ---
-                if utime.time() - last_schedule_sync >= SYNC_INTERVAL:
-                    try:
-                        schedule_sync.sync()
-                        # If zones changed, re-init relay controller would need reboot
-                        # For now: log a note; zone hardware changes require reboot
-                    except Exception as ex:
-                        print("Schedule sync failed (non-fatal):", ex)
-                    last_schedule_sync = utime.time()
+                    last_cloud_sync = utime.time()
                     wdt.feed()
 
                 # An update was downloaded and is staged — apply it as soon as
