@@ -11,7 +11,10 @@
 
 import utime
 import gc
+import ujson
+import os
 import _thread
+import machine
 from machine import I2C, Pin, reset, WDT
 
 import secrets
@@ -141,6 +144,107 @@ def _format_ip_version(ip, version):
     return ip, version_text  # LCDStatus's own row-truncation is the fallback
 
 
+def _reset_cause_name():
+    """Human-readable reason for the last reset, e.g. "watchdog_reset" --
+    pushed to Firebase so a board that can't be physically reached (no
+    serial console) can still be diagnosed remotely. Looked up by name via
+    getattr rather than referencing machine.WDT_RESET etc. directly, since
+    not every constant is guaranteed present on every MicroPython port."""
+    cause = machine.reset_cause()
+    for name in ("WDT_RESET", "PWRON_RESET", "HARD_RESET", "SOFT_RESET", "DEEPSLEEP_RESET"):
+        if cause == getattr(machine, name, object()):
+            return name.lower()
+    return "unknown({})".format(cause)
+
+
+_BOOT_COUNT_FILE = "boot_count.json"
+
+
+def _next_boot_count():
+    """Persisted boot counter. A rapid climb between two checks a person
+    happens to glance at is the corroborating signal for a reset loop
+    (e.g. the watchdog repeatedly firing) -- on its own, last_reset_cause
+    only proves the most recent reset's cause, not whether it's happening
+    over and over."""
+    try:
+        with open(_BOOT_COUNT_FILE, "r") as f:
+            count = ujson.load(f).get("count", 0)
+    except Exception:
+        count = 0
+    count += 1
+    try:
+        with open(_BOOT_COUNT_FILE, "w") as f:
+            ujson.dump({"count": count}, f)
+    except Exception:
+        pass  # diagnostic only, never fatal
+    return count
+
+
+_CHECKPOINT_FILE = "loop_checkpoint.json"
+
+
+def _set_checkpoint(name):
+    """Record which operation is in flight, right before anything that
+    could plausibly be the thing a watchdog reset catches mid-call (a
+    wedged Wi-Fi driver, in particular). If a reset happens here, whatever
+    name was last written is readable on the NEXT boot -- see
+    _read_and_clear_checkpoint() -- pinpointing which call was running
+    instead of just "a reset occurred, cause unknown"."""
+    try:
+        with open(_CHECKPOINT_FILE, "w") as f:
+            ujson.dump({"checkpoint": name, "at": utime.time()}, f)
+    except Exception:
+        pass
+
+
+def _read_and_clear_checkpoint():
+    checkpoint = None
+    try:
+        with open(_CHECKPOINT_FILE, "r") as f:
+            checkpoint = ujson.load(f)
+    except Exception:
+        pass
+    try:
+        os.remove(_CHECKPOINT_FILE)
+    except Exception:
+        pass
+    return checkpoint
+
+
+_RUN_STATE_FILE = "run_state.json"
+
+
+def _save_run_state(zone_id, start_epoch, duration_seconds, mode):
+    """Persisted so an interrupted run (watchdog reset, power blip, any
+    unplanned reboot) can resume on the next boot instead of just staying
+    off for the rest of its intended window."""
+    try:
+        with open(_RUN_STATE_FILE, "w") as f:
+            ujson.dump({
+                "zone_id":          zone_id,
+                "start_epoch":      start_epoch,
+                "duration_seconds": duration_seconds,
+                "mode":             mode,
+            }, f)
+    except Exception:
+        pass  # best-effort -- a failed save just means no resume, not a crash
+
+
+def _load_run_state():
+    try:
+        with open(_RUN_STATE_FILE, "r") as f:
+            return ujson.load(f)
+    except Exception:
+        return None
+
+
+def _clear_run_state():
+    try:
+        os.remove(_RUN_STATE_FILE)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Run control
 # ---------------------------------------------------------------------------
@@ -152,6 +256,7 @@ def start_run(zone_id, duration_seconds, mode):
     now_epoch = get_now_epoch()
     relay.on(zone_id)
     state.start_run(now_epoch, duration_seconds, mode, zone_id)
+    _save_run_state(zone_id, now_epoch, duration_seconds, mode)
     print("Run started: zone={} mode={} duration={}s".format(zone_id, mode, duration_seconds))
 
 
@@ -163,6 +268,7 @@ def _stop_relay_for_current_zone():
 def stop_run(status_str="completed"):
     if not state.is_running():
         relay.all_off()
+        _clear_run_state()
         return
     start_epoch = state.current_run_start_epoch
     mode        = state.current_run_mode
@@ -171,6 +277,7 @@ def stop_run(status_str="completed"):
 
     _stop_relay_for_current_zone()
     state.stop_run()
+    _clear_run_state()
 
     config["last_run"] = {
         "start_epoch": start_epoch,
@@ -248,7 +355,21 @@ def main():
     # constant to remember to bump.
     firmware_version = get_local_version()
 
+    # Captured once, up front: reset_cause() reflects the previous reset
+    # regardless of when it's read, but reading it early keeps it clearly
+    # separated from anything below that could theoretically also touch
+    # machine state. Pushed to Firebase further down so a board with no
+    # physical/serial access can still be checked for a reset loop.
+    boot_reset_cause = _reset_cause_name()
+    boot_count       = _next_boot_count()
+    # TEMPORARY diagnostic for the CYW43 hang investigation -- remove once
+    # we've confirmed which MicroPython build is on this board and whether
+    # updating it changes anything.
+    mpy_version = os.uname().version
+
     print("LetItRain v{} booting...".format(firmware_version))
+    print("Boot #{}, reset cause: {}".format(boot_count, boot_reset_cause))
+    print("MicroPython:", mpy_version)
     print("Zones configured:", relay.zone_ids())
 
     # --- Wi-Fi ---
@@ -317,6 +438,41 @@ def main():
         print("NTP: sync failed (non-fatal):", ex)
     wdt.feed()
 
+    # --- Diagnostics from the previous boot ---
+    # Read (and clear) before anything else touches loop_checkpoint.json,
+    # so it reflects whatever was in flight right before THIS boot's reset
+    # rather than something from further back.
+    last_checkpoint = _read_and_clear_checkpoint()
+    if last_checkpoint:
+        print("Last checkpoint before this boot: {} (age {}s)".format(
+            last_checkpoint.get("checkpoint"),
+            utime.time() - last_checkpoint.get("at", utime.time())))
+
+    # --- Resume an interrupted run, if one was in progress ---
+    # Placed after NTP sync so get_now_epoch() is trustworthy for the
+    # window check below. relay.all_off() already ran unconditionally at
+    # the very top of boot (the safety invariant) -- resuming here is a
+    # deliberate re-energize afterward, not a bypass of that safety step.
+    try:
+        persisted = _load_run_state()
+        if persisted is not None:
+            p_zone     = persisted["zone_id"]
+            p_start    = persisted["start_epoch"]
+            p_duration = persisted["duration_seconds"]
+            p_mode     = persisted["mode"]
+            now        = get_now_epoch()
+            if now < p_start + p_duration:
+                print("Resuming interrupted run: zone={} mode={} "
+                      "remaining={}s".format(p_zone, p_mode, p_start + p_duration - now))
+                relay.on(p_zone)
+                state.start_run(p_start, p_duration, p_mode, p_zone)
+            else:
+                print("Interrupted run's window already elapsed -- not resuming")
+                _clear_run_state()
+    except Exception as ex:
+        print("Run-resume check failed (non-fatal):", ex)
+        _clear_run_state()
+
     # --- Firebase ---
     fb = FirebaseClient(
         api_key=FIREBASE_API_KEY, email=FIREBASE_EMAIL,
@@ -380,9 +536,15 @@ def main():
 
         # Pushed in its own try block: the app relies on meta/local_ip to know
         # which IP to probe for local mode, so a schedule-sync failure above
-        # must never prevent this from being written.
+        # must never prevent this from being written. reset_cause/boot_count
+        # only need to go out once, here at boot -- the periodic push_ip()
+        # call later in the main loop omits them so it doesn't keep
+        # re-sending an increasingly stale boot-time snapshot.
         try:
-            status_writer.push_ip(local_ip)
+            status_writer.push_ip(local_ip, reset_cause=boot_reset_cause,
+                                  boot_count=boot_count,
+                                  last_checkpoint=last_checkpoint,
+                                  mpy_version=mpy_version)
         except Exception as ex:
             print("Firebase push_ip failed (non-fatal):", ex)
         wdt.feed()
@@ -410,15 +572,30 @@ def main():
     last_ip_push       = utime.time()
     last_update_check  = utime.time()
     last_ota_poll      = utime.time()
+    last_lcd_refresh   = 0
+    last_idle_collect  = 0
     last_ota_status_pushed = None
     # Relaxed from the original 15/60/30s: the app tolerates 30-45s of
     # staleness on everything, and every one of these is a Firebase/TLS
     # round-trip competing for this board's limited RAM -- halving the call
     # rate directly eases that pressure, not just a latency trade-off.
+    #
+    # SYNC_INTERVAL and OTA_POLL_INTERVAL relaxed further (90->180, 45->120)
+    # after observing a watchdog reset roughly every 3 minutes on the live
+    # board -- neither is gated by run-state (that only skips them while a
+    # zone is actively running, see below), so at idle this board was doing
+    # a heartbeat + OTA poll + schedule sync interleaved roughly every
+    # 15-20s combined, each one a TLS handshake that could hit the CYW43
+    # wedge. Schedule changes and manual "check for update" requests are
+    # both infrequent, deliberate user actions -- a few minutes of latency
+    # picking them up is an easy trade for meaningfully fewer TLS handshakes
+    # per minute. STATUS_INTERVAL is left alone since it's the "device
+    # online" freshness signal the app depends on.
     STATUS_INTERVAL   = 30
-    SYNC_INTERVAL     = 90
+    SYNC_INTERVAL     = 180
     IP_PUSH_INTERVAL  = 300  # re-check/re-push local_ip every 5 min
-    OTA_POLL_INTERVAL = 45   # manual "check now" trigger + status push
+    OTA_POLL_INTERVAL = 120  # manual "check now" trigger + status push
+    LCD_REFRESH_INTERVAL = 30  # was every ~5s pass -- see LCD status refresh comment below
 
     # wdt was already armed right after Wi-Fi settled, above -- from here
     # on it's fed after each section below (heartbeat, OTA poll, IP check,
@@ -455,10 +632,17 @@ def main():
                 wdt.feed()  # covers I2C/RTC access above, if that's ever the hang
 
                 # --- LCD status refresh ---
-                # Cheap to call every pass (~5s): no I/O of its own, and
-                # LCDStatus only actually touches the display when a
-                # field's text changed since the last draw.
-                if lcd_status:
+                # Was unconditional every ~5s pass; throttled to the same
+                # 30s cadence as the heartbeat instead. LCDStatus's own
+                # diffing means most of that was already a no-op on the
+                # display side, but get_next_slot() still re-scanned the
+                # whole schedule and rebuilt strings every single pass --
+                # one of the changes reduced here (alongside the idle-loop
+                # gc.collect() backstop below) while we isolate what in
+                # 1.2.16 made mid-run watchdog resets start happening,
+                # since neither needs sub-30s freshness on a physical
+                # display that isn't even being watched continuously.
+                if lcd_status and utime.time() - last_lcd_refresh >= LCD_REFRESH_INTERVAL:
                     zone_text = ("Zone {}".format(state.current_zone_id)
                                  if state.is_running() else "Idle")
                     next_slot = get_next_slot(config.get("schedule", {}),
@@ -475,6 +659,7 @@ def main():
                         next_text = "No sched"
                     ip_text, version_text = _format_ip_version(local_ip, firmware_version)
                     lcd_status.show_status(zone_text, next_text, ip_text, version_text)
+                    last_lcd_refresh = utime.time()
 
                 # --- Stop check ---
                 if state.should_stop_now(now_epoch):
@@ -519,6 +704,15 @@ def main():
                 # specific call can land, and it's the one the app's
                 # "device online" freshness check depends on.
                 if utime.time() - last_status_push >= STATUS_INTERVAL:
+                    # Checkpointed specifically around this one call (not
+                    # every loop section -- that would mean a flash write
+                    # every ~5s forever) since it's the leading suspect for
+                    # the mid-run watchdog resets: it's the only Firebase
+                    # call that still fires while a zone is running, at a
+                    # fixed 30s cadence that lines up with when resets have
+                    # been observed. Temporary diagnostic -- safe to remove
+                    # once last_checkpoint confirms (or rules out) this call.
+                    _set_checkpoint("heartbeat_call")
                     try:
                         status_writer.push_status(
                             active_skip=local_override["skip_today"],
@@ -528,6 +722,7 @@ def main():
                     except Exception as ex:
                         print("Firebase heartbeat failed (non-fatal):", ex)
                         status_led.set_mode("no_internet")
+                    _set_checkpoint("heartbeat_done")
                     last_status_push = utime.time()
                     wdt.feed()
 
@@ -535,7 +730,15 @@ def main():
                 # Own interval, separate from the heartbeat above, so a
                 # pending "check now" from the app doesn't add extra
                 # round-trips to the time-sensitive online/offline signal.
-                if utime.time() - last_ota_poll >= OTA_POLL_INTERVAL:
+                # Skipped entirely while a zone is running: applying an
+                # update mid-run is already blocked further down (gated on
+                # not state.is_running()), so checking for one here serves
+                # no purpose during a run -- it's just another TLS
+                # handshake that could wedge the Wi-Fi driver and trip the
+                # watchdog (relay.all_off() runs on every boot, so a hang
+                # here would cut a run short) during the exact window
+                # where we most want nothing else touching the radio.
+                if not state.is_running() and utime.time() - last_ota_poll >= OTA_POLL_INTERVAL:
                     if not update_pending and fb.id_token:
                         try:
                             update_info = fb.get("update") or {}
@@ -585,7 +788,11 @@ def main():
                     wdt.feed()
 
                 # --- Schedule sync ---
-                if utime.time() - last_schedule_sync >= SYNC_INTERVAL:
+                # Also skipped while running -- same reasoning as the OTA
+                # poll above: nothing here needs to happen mid-run, and it's
+                # one more avoidable Firebase round-trip during the window
+                # that most needs to stay stable.
+                if not state.is_running() and utime.time() - last_schedule_sync >= SYNC_INTERVAL:
                     try:
                         schedule_sync.sync()
                         # If zones changed, re-init relay controller would need reboot
@@ -622,11 +829,17 @@ def main():
 
             # Defensive backstop for passes where nothing above touched a
             # socket (e.g. no interval elapsed yet) and so never triggered
-            # one of the collect-right-after-close() calls elsewhere --
-            # this 5s idle window is otherwise dead time, so the cost is
-            # free.
-            mem_diag.sample()
-            gc.collect()
+            # one of the collect-right-after-close() calls elsewhere.
+            # Was unconditional every ~5s pass; throttled to 30s alongside
+            # the LCD refresh above -- same reasoning: an unconditional
+            # gc.collect() every single pass is new in 1.2.16 and one of
+            # the changes being reduced while isolating what made mid-run
+            # watchdog resets start happening. The socket-adjacent collects
+            # elsewhere already cover the moments that actually matter.
+            if utime.time() - last_idle_collect >= STATUS_INTERVAL:
+                mem_diag.sample()
+                gc.collect()
+                last_idle_collect = utime.time()
 
     finally:
         relay.all_off()
