@@ -42,8 +42,10 @@ class ScheduleSync:
                 "enabled": day_data.get("enabled", False),
                 "slots":   {str(i): s for i, s in enumerate(slots)},
             }
-        self._fb.patch("schedule", fb_schedule)
-        print("ScheduleSync: pushed local schedule to Firebase")
+        if self._fb.patch("schedule", fb_schedule):
+            print("ScheduleSync: pushed local schedule to Firebase")
+        else:
+            print("ScheduleSync: schedule push failed (non-fatal) -- see patch() error above")
 
     def _push_zones_to_firebase(self):
         zones = self._config.get("zones", [])
@@ -52,5 +54,7 @@ class ScheduleSync:
             "pin":     z.get("pin", 0),
             "enabled": z.get("enabled", False),
         } for z in zones}
-        self._fb.patch("zones", fb_zones)
-        print("ScheduleSync: pushed local zones to Firebase")
+        if self._fb.patch("zones", fb_zones):
+            print("ScheduleSync: pushed local zones to Firebase")
+        else:
+            print("ScheduleSync: zones push failed (non-fatal) -- see patch() error above")

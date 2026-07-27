@@ -49,14 +49,20 @@ struct HomeView: View {
             Spacer()
             Button { showDiagnostics = true } label: {
                 HStack(spacing: 6) {
-                    Circle()
-                        .fill(modeColor)
-                        .frame(width: 7, height: 7)
-                        .opacity(connectionManager.mode == .offline ? 0.5 : 1)
+                    if connectionManager.isEvaluating {
+                        ProgressView().scaleEffect(0.6).frame(width: 7, height: 7)
+                    } else {
+                        Circle()
+                            .fill(modeColor)
+                            .frame(width: 7, height: 7)
+                            .opacity(connectionManager.mode == .offline ? 0.5 : 1)
+                    }
 
-                    Text(connectionManager.mode.displayName)
+                    Text(connectionManager.isEvaluating
+                         ? "Trying to connect to sprinkler…"
+                         : connectionManager.mode.displayName)
                         .font(.caption2.weight(.semibold))
-                        .foregroundColor(modeColor)
+                        .foregroundColor(connectionManager.isEvaluating ? .white.opacity(0.6) : modeColor)
 
                     Image(systemName: "info.circle")
                         .font(.caption2)

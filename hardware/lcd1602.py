@@ -6,13 +6,21 @@
 # (RW is tied low on the backpack itself -- write-only).
 #
 # The shift register's 8 outputs map to (bit7 shifted out first):
-#   bit7  backlight (1=on)      bit3  D7
-#   bit6  D4                    bit2  Enable
-#   bit5  D5                    bit1  RS (0=command, 1=character data)
-#   bit4  D6                    bit0  unused (RW, tied low)
-# This mapping was reverse-engineered from Adafruit's own
-# Adafruit_LiquidCrystal library (its SPI constructor's pin assignments),
-# not copied from it -- this is a fresh bit-banged implementation.
+#   bit7  unused (RW, tied low)  bit3  D6
+#   bit6  backlight (1=on)       bit2  D7
+#   bit5  D4                     bit1  Enable
+#   bit4  D5                     bit0  RS (0=command, 1=character data)
+# Verified directly against Adafruit's own reference implementation
+# (adafruit_character_lcd/character_lcd_spi.py's ShiftRegister74HC595
+# pin assignment: get_pin(0..6) => RS, Enable, D7, D6, D5, D4,
+# backlight) -- an earlier version of this file had every one of these
+# shifted one bit too high (a genuine reverse-engineering mistake, not
+# a hardware/wiring issue), which meant the "backlight" bit didn't
+# actually reach the backlight circuit at all, and RS/Enable/D4-D7 were
+# each landing one signal off from what the HD44780 expected -- enough
+# to leave the display showing uninitialized blank character cells
+# (whose visibility the contrast pot still affects, since that's a
+# separate analog circuit) but never a working init sequence.
 #
 # Every register update is: LAT low, shift the byte out MSB-first while
 # pulsing CLK once per bit, then LAT high (rising edge copies the shift
@@ -41,7 +49,7 @@ class LCD1602:
         self._dat = Pin(dat_pin, Pin.OUT)
         self._clk = Pin(clk_pin, Pin.OUT)
         self._lat = Pin(lat_pin, Pin.OUT)
-        self._backlight = 0x80  # on by default
+        self._backlight = 0x40  # bit6, on by default -- see module header for bit mapping
         self._init_display()
 
     # ------------------------------------------------------------------
@@ -65,14 +73,14 @@ class LCD1602:
         # each of those lands on.
         base = (
             self._backlight
-            | (rs << 1)
-            | ((nibble & 0x01) << 6)   # D4
-            | ((nibble & 0x02) << 4)   # D5
-            | ((nibble & 0x04) << 2)   # D6
-            | ((nibble & 0x08) << 0)   # D7
+            | (rs << 0)
+            | ((nibble & 0x01) << 5)   # D4
+            | ((nibble & 0x02) << 3)   # D5
+            | ((nibble & 0x04) << 1)   # D6
+            | ((nibble & 0x08) >> 1)   # D7
         )
         self._latch(base)          # EN=0, data+RS settled
-        self._latch(base | 0x04)   # EN=1 -- HD44780 samples while high
+        self._latch(base | 0x02)   # EN=1 -- HD44780 samples while high
         utime.sleep_us(2)
         self._latch(base)          # EN=0 -- falling edge latches the nibble
         utime.sleep_us(2)
@@ -123,5 +131,5 @@ class LCD1602:
             self._data(ord(ch))
 
     def set_backlight(self, on):
-        self._backlight = 0x80 if on else 0x00
+        self._backlight = 0x40 if on else 0x00
         self._latch(self._backlight)

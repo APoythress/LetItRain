@@ -47,6 +47,7 @@ class FirebaseClient:
         self._id_token     = None
         self._uid          = None
         self._token_issued = 0   # utime.time() when token was obtained
+        self._last_auth_error = None  # last authenticate() failure message, for boot_log.json
 
     @property
     def id_token(self):
@@ -61,6 +62,14 @@ class FirebaseClient:
         yet. Used to self-claim device_owner_uid at boot and for the
         optional FIREBASE_EXPECTED_UID cross-check in secrets.py."""
         return self._uid
+
+    @property
+    def last_auth_error(self):
+        """Human-readable reason the most recent authenticate() call failed,
+        or None if it succeeded (or hasn't been tried). Surfaced in
+        boot_log.json so an auth failure is diagnosable remotely via
+        GET /boot-log, without needing a serial console."""
+        return self._last_auth_error
 
     # ------------------------------------------------------------------
     # Authentication
@@ -93,13 +102,16 @@ class FirebaseClient:
                 self._id_token     = data["idToken"]
                 self._uid          = data.get("localId")
                 self._token_issued = utime.time()
+                self._last_auth_error = None
                 print("Firebase: authenticated OK")
                 return True
             else:
-                print("Firebase: auth failed:", data.get("error", {}).get("message", "unknown"))
+                self._last_auth_error = data.get("error", {}).get("message", "unknown")
+                print("Firebase: auth failed:", self._last_auth_error)
                 return False
 
         except Exception as ex:
+            self._last_auth_error = str(ex)
             print("Firebase: authenticate exception:", ex)
             return False
         finally:

@@ -10,9 +10,11 @@
 #   POST /skip-today      → set local skip override
 #   POST /cancel-skip     → clear local skip override
 #   POST /check-update    → trigger an immediate OTA check (bypasses the
-#                           30-min cloud-sync pass main.py otherwise waits for)
+#                           15-min cloud-sync pass main.py otherwise waits for)
 #   POST /resync-time     → trigger an immediate NTP resync (also runs
 #                           automatically once daily at 3am local time)
+#   GET  /boot-log        → last boot's diagnostics (Wi-Fi/Firebase/RTC
+#                           status) -- see main.py's boot_log.json write
 
 import ujson
 import usocket
@@ -214,6 +216,16 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
             elif method == "POST" and path == "/resync-time":
                 local_resync_trigger["requested"] = True
                 _json_response(conn, 200, {"requested": True})
+
+            elif method == "GET" and path == "/boot-log":
+                try:
+                    with open("boot_log.json", "r") as f:
+                        _json_response(conn, 200, ujson.load(f))
+                except Exception:
+                    # Missing on a device that hasn't rebooted since this
+                    # feature was added, or a corrupt/partial write -- either
+                    # way, a clear response beats a generic 500.
+                    _json_response(conn, 404, {"error": "no boot log available yet"})
 
             else:
                 _json_response(conn, 405, {"error": "not found", "path": path})

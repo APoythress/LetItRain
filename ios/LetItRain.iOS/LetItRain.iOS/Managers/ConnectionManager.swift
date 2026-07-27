@@ -28,8 +28,12 @@
 // later. Event-driven re-evaluation covers every case that actually matters
 // (network changed, app came back to the foreground, a request just failed)
 // without a clock ticking in the background competing for that one
-// connection slot. The probe below also retries once before concluding
-// "remote," to absorb the Pico being mid-request for a split second.
+// connection slot. Each evaluation is patient rather than being one single
+// attempt though: step 2 waits briefly for Firebase's meta listener to
+// deliver its first snapshot if it hasn't yet, and the probe in step 3
+// retries up to 4 times, since on a cold app launch the very first
+// evaluation is often racing data that just hasn't arrived yet rather than
+// a genuine "Pico unreachable."
 //
 // Diagnostics: every evaluation appends a `ConnectionDiagnostics.Entry` to
 // `history` (newest first, capped) and updates `lastEntry`. Both are
@@ -232,8 +236,18 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
-        // Step 2: Get the Pico's local IP from Firebase
-        let meta = await metaProvider?()
+        // Step 2: Get the Pico's local IP from Firebase. On a cold app
+        // launch this can race the Firebase listener's very first snapshot
+        // -- give it a few short retries before concluding there's
+        // genuinely no IP yet, rather than failing to remote on the first
+        // possible instant the listener just hasn't delivered anything.
+        var meta = await metaProvider?()
+        var metaRetries = 0
+        while (meta == nil || meta!.localIp.isEmpty || meta!.localIp == "0.0.0.0") && metaRetries < 4 {
+            metaRetries += 1
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            meta = await metaProvider?()
+        }
         trace.metaFound = meta != nil
         trace.localIp = meta?.localIp ?? "nil (metaProvider returned nothing)"
 
@@ -244,11 +258,13 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
-        // Step 3: Probe the Pico HTTP server. Retried once after a short
-        // pause before concluding "remote" -- the Pico's single-threaded
-        // HTTP server can be mid-request for another caller for a moment,
-        // which shouldn't be enough on its own to flip the whole app to
-        // remote and back.
+        // Step 3: Probe the Pico HTTP server, up to 4 attempts with a short
+        // pause between each before concluding "remote" -- the Pico's
+        // single-threaded HTTP server can be mid-request for another caller
+        // for a moment, which shouldn't be enough on its own to flip the
+        // whole app to remote. Since evaluation is only event-driven now
+        // (no background timer -- see file header), it's worth being
+        // patient here rather than giving up after one blip.
         let probeURL = URL(string: "http://\(meta.localIp)/status")!
         trace.probeAttempted = true
         trace.probeURL = probeURL.absoluteString
@@ -265,7 +281,7 @@ final class ConnectionManager: ObservableObject {
                 trace.stoppedAt = "3: probe succeeded → local (attempt \(attempt))"
                 return
             }
-            if attempt >= 2 { break }
+            if attempt >= 4 { break }
             try? await Task.sleep(nanoseconds: 750_000_000)
         }
 

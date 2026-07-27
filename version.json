@@ -1,4 +1,4 @@
 {
-  "version": "1.3.1",
-  "notes": "Bundled first push since 1.3.0: schedule_sync push-only fix (no more silent overwrite of local edits), connection-flapping fix (removed dueling iOS polling timers), 30-min cloud-sync interval, and automatic/manual NTP clock resync."
+  "version": "1.3.6",
+  "notes": "Fixes hardware/lcd1602.py's shift-register bit mapping -- every signal (RS/Enable/D4-D7/backlight) was one bit position higher than this backpack actually wires, verified against Adafruit's own character_lcd_spi.py reference. Backlight bit wasn't reaching the backlight circuit at all; explains uninitialized blank display + dead backlight despite correct wiring/orientation/SPI-enable-bridge."
 }

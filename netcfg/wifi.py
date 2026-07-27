@@ -30,6 +30,15 @@ def connect_wifi(ssid, password, max_attempts=40, delay_ms=500, on_wait=None):
     wlan.active(True)
 
     if wlan.isconnected():
+        # Unlike the connect-and-poll path below, this returns instantly --
+        # the radio retained its association across a reset, but that only
+        # means link-level connectivity is up, not that the network stack
+        # (routing, DNS) has actually settled yet. A DNS-dependent call
+        # (NTP, Firebase auth) attempted in the first moment after boot can
+        # transiently fail even though isconnected() already reports true.
+        # The normal poll loop below never has this problem since it takes
+        # at least a few hundred ms of polling before it can return.
+        utime.sleep_ms(500)
         print("Wi-Fi already connected:", wlan.ifconfig())
         return wlan
 

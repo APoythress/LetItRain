@@ -5,12 +5,16 @@
 #   - Multi-zone relay control (up to 5 zones, configurable GPIO pins)
 #   - Multi-slot scheduler: multiple start times per day, per zone
 #   - HTTP JSON API for local iOS control
-#   - Firebase writer: status + meta (IP, zone count), batched once/hour
-#   - Firebase reader: schedule + zone config, batched once/hour
+#   - Firebase writer: status + meta (IP, zone count), batched every 15 min
+#   - Firebase reader: schedule + zone config, batched every 15 min
 #   - Firebase override reader: skip-for-N-days support (remote only)
+#   - Boot diagnostics: written to boot_log.json, readable via GET /boot-log
+#     -- lets Wi-Fi/Firebase/RTC boot status be checked without physical/
+#     serial access to the board (see BOOT_LOG_FILE below)
 
 import utime
 import gc
+import ujson
 import _thread
 from machine import I2C, Pin, reset, WDT
 
@@ -63,9 +67,10 @@ try:
     # LCD is non-fatal like the RTC below -- an unwired/broken backpack
     # shouldn't take the whole controller down, it just means no display.
     try:
-        lcd        = LCD1602(dat_pin=18, clk_pin=19, lat_pin=20)
+        lcd        = LCD1602(dat_pin=11, clk_pin=10, lat_pin=11)
         lcd_status = LCDStatus(lcd)
         lcd_status.show_message("Booting")
+        print("LCD: initialized OK")
     except Exception as ex:
         print("LCD init failed (not wired?):", ex)
         lcd_status = None
@@ -146,6 +151,22 @@ def sync_time_from_ntp():
     except Exception as ex:
         print("NTP sync failed (non-fatal):", ex)
         return False
+
+
+BOOT_LOG_FILE = "boot_log.json"
+
+
+def _write_boot_log(log):
+    """Persist the boot diagnostics dict so GET /boot-log (web/server.py)
+    can serve it without needing a serial console -- the physical board is
+    inconvenient to reach, so this is the primary way to check Wi-Fi/
+    Firebase/RTC boot status remotely. Best-effort: a failed write here
+    should never affect boot itself."""
+    try:
+        with open(BOOT_LOG_FILE, "w") as f:
+            ujson.dump(log, f)
+    except Exception as ex:
+        print("Boot log write failed (non-fatal):", ex)
 
 
 def _format_ip_version(ip, version):
@@ -230,7 +251,7 @@ def on_manual_stop():
 local_override = {"skip_today": False, "skip_reason": None}
 
 # Set by web/server.py's /check-update endpoint so a local LAN user gets an
-# instant OTA check instead of waiting for the 30-min cloud-sync pass.
+# instant OTA check instead of waiting for the 15-min cloud-sync pass.
 local_update_trigger = {"requested": False}
 
 # Set by web/server.py's /resync-time endpoint for an instant manual NTP
@@ -286,9 +307,21 @@ def main():
     print("LetItRain v{} booting...".format(firmware_version))
     print("Zones configured:", relay.zone_ids())
 
+    # Boot diagnostics, written to boot_log.json at the end of boot (see
+    # _write_boot_log() below) and readable via GET /boot-log -- the primary
+    # way to check Wi-Fi/Firebase/RTC boot status without physical/serial
+    # access to the board.
+    boot_log = {
+        "firmware_version": firmware_version,
+        "zones_configured": relay.zone_ids(),
+        "lcd_present":      lcd_status is not None,
+        "rtc_present":      rtc is not None,
+    }
+
     # --- Wi-Fi ---
-    wlan     = None
-    local_ip = "0.0.0.0"
+    wlan       = None
+    local_ip   = "0.0.0.0"
+    wifi_error = None
     try:
         wlan = connect_wifi(WIFI_SSID, WIFI_PASSWORD, on_wait=status_led.tick)
         local_ip = wlan.ifconfig()[0]
@@ -303,6 +336,7 @@ def main():
                     break
     except Exception as ex:
         print("Wi-Fi failed (non-fatal, running offline):", ex)
+        wifi_error = str(ex)
         # connect_wifi() can time out right as the connection is actually
         # completing (status flips CONNECTING -> NOIP -> UP in the last
         # couple of attempts, then DHCP finishes moments after we gave up).
@@ -313,9 +347,14 @@ def main():
             wlan = network.WLAN(network.STA_IF)
             if wlan.isconnected():
                 local_ip = wlan.ifconfig()[0]
+                wifi_error = None  # recovered -- don't report a stale failure
                 print("Wi-Fi: connected shortly after timeout, IP:", local_ip)
         except Exception:
             pass
+
+    boot_log["wifi_connected"] = wlan is not None and wlan.isconnected()
+    boot_log["local_ip"]       = local_ip
+    boot_log["wifi_error"]     = wifi_error
 
     # --- Hardware watchdog ---
     # Armed here, right after Wi-Fi settles, not any earlier: Wi-Fi retries
@@ -339,13 +378,26 @@ def main():
     # and sync_time_from_ntp()) -- the DS3231's own crystal drifts a little
     # over weeks/months of continuous uptime, and this device is meant to
     # run for a long time between reboots.
-    if sync_time_from_ntp():
+    ntp_synced = sync_time_from_ntp()
+    wdt.feed()  # a single slow (not just fast-failing) attempt could itself
+                # approach the 8s WDT timeout -- feed right after every
+                # individual network attempt below, not just once at the end
+                # of the section, so no gap between feeds can ever stack two
+                # such attempts past the deadline.
+    if not ntp_synced:
+        # Same transient-DNS reasoning as the Firebase retry below -- one
+        # retry after a short pause, cheap and boot-only.
+        utime.sleep_ms(1500)
+        ntp_synced = sync_time_from_ntp()
+        wdt.feed()
+    if ntp_synced:
         print("NTP: time synced" + (
             ", RTC synced to {}".format(rtc.iso_string()) if rtc else ""))
         last_ntp_sync_date = get_now_date_string()
     else:
         last_ntp_sync_date = None  # force a retry the moment 3am next comes around
-    wdt.feed()
+    boot_log["ntp_synced"] = ntp_synced
+    boot_log["boot_epoch"] = get_now_epoch()
 
     # --- Firebase ---
     fb = FirebaseClient(
@@ -358,7 +410,26 @@ def main():
         firebase_ok = fb.authenticate()
     except Exception as ex:
         print("Firebase auth failed (non-fatal):", ex)
-    wdt.feed()
+    wdt.feed()  # each authenticate() attempt has its own 8s internal
+                # request timeout (see firebase/client.py) -- feeding here,
+                # before the retry below, is not optional.
+    if not firebase_ok:
+        # One retry after a short pause -- a DNS-dependent call attempted
+        # too soon after boot (see connect_wifi()'s "already connected"
+        # comment) can fail transiently even with correct credentials and a
+        # genuinely working network. Cheap to always retry once regardless
+        # of the failure reason: a real credentials error just fails the
+        # same way again, at the cost of one extra request, at boot only.
+        utime.sleep_ms(1500)
+        try:
+            firebase_ok = fb.authenticate()
+            if firebase_ok:
+                print("Firebase: authenticated OK on retry")
+        except Exception as ex:
+            print("Firebase auth retry failed (non-fatal):", ex)
+        wdt.feed()
+    boot_log["firebase_auth_ok"]    = firebase_ok
+    boot_log["firebase_auth_error"] = None if firebase_ok else fb.last_auth_error
 
     # Optional sanity check against secrets.py's FIREBASE_EXPECTED_UID (only
     # present if the deployer filled it in after a first successful boot).
@@ -366,7 +437,10 @@ def main():
     # here, instead of via a confusing permission failure several steps
     # later once device_owner_uid rejects a write from the wrong account.
     expected_uid = getattr(secrets, "FIREBASE_EXPECTED_UID", None)
-    if firebase_ok and expected_uid and fb.uid != expected_uid:
+    boot_log["firebase_uid"] = fb.uid
+    boot_log["expected_uid_mismatch"] = bool(
+        firebase_ok and expected_uid and fb.uid != expected_uid)
+    if boot_log["expected_uid_mismatch"]:
         print("Firebase: WARNING authenticated UID {} != FIREBASE_EXPECTED_UID "
               "{} in secrets.py -- wrong device credentials for this "
               "Pico?".format(fb.uid, expected_uid))
@@ -379,9 +453,11 @@ def main():
     # different account (e.g. two friends both left FIREBASE_DEVICE_ID at
     # its default value) -- surfaced immediately and specifically, instead
     # of as a generic meta-patch 401 several boot steps later.
+    boot_log["device_owner_uid_claimed"] = None  # not attempted (Firebase auth failed)
     if firebase_ok:
         try:
-            if not fb.put("device_owner_uid", fb.uid):
+            boot_log["device_owner_uid_claimed"] = fb.put("device_owner_uid", fb.uid)
+            if not boot_log["device_owner_uid_claimed"]:
                 print("Firebase: device_owner_uid claim failed -- this "
                       "device_id may already be owned by a different "
                       "account. Pick a unique FIREBASE_DEVICE_ID.")
@@ -389,6 +465,7 @@ def main():
                     lcd_status.show_message("ID already used")
         except Exception as ex:
             print("Firebase: device_owner_uid claim exception (non-fatal):", ex)
+            boot_log["device_owner_uid_claimed"] = False
         wdt.feed()
 
     status_writer   = StatusWriter(fb, state, config, firmware_version,
@@ -443,11 +520,11 @@ def main():
     # this board was doing a TLS handshake every 15-20s combined at idle,
     # which is what wedges the Pico W's CYW43 WiFi chip. Collapsed into one
     # batched pass on a single relaxed clock: status, IP, schedule push, and
-    # OTA-trigger check all fire together every 30 min instead of on their
+    # OTA-trigger check all fire together every 15 min instead of on their
     # own clocks all day. Run-completion data isn't delayed by this --
     # push_last_run() (see stop_run()) still fires immediately and
     # separately the moment a run actually ends.
-    CLOUD_SYNC_INTERVAL = 1800  # 30 min -- still ~60x fewer handshakes than the old combined cadence
+    CLOUD_SYNC_INTERVAL = 900  # 15 min -- ~15x fewer handshakes/hour than the old combined cadence, still well clear of the wedge threshold
 
     # wdt was already armed right after Wi-Fi settled, above -- from here
     # on it's fed after each section below (cloud sync, ...) and every 100ms
@@ -472,6 +549,10 @@ def main():
     mem_diag.sample()
     print("Heap: {} bytes total, {} free at boot".format(
         mem_diag.heap_total(), gc.mem_free()))
+
+    boot_log["heap_total_bytes"]      = mem_diag.heap_total()
+    boot_log["free_mem_bytes_at_boot"] = gc.mem_free()
+    _write_boot_log(boot_log)
 
     print("Main loop started.")
 
@@ -565,7 +646,7 @@ def main():
                 # --- Local "check for update now" trigger ---
                 # Separate from the batched cloud-sync pass below and not
                 # gated on its clock, so tapping "Check for Update" while on
-                # the LAN still feels instant instead of waiting up to 30 min.
+                # the LAN still feels instant instead of waiting up to 15 min.
                 if (local_update_trigger["requested"] and not state.is_running()
                         and not update_pending):
                     local_update_trigger["requested"] = False
@@ -584,7 +665,7 @@ def main():
                 # as elsewhere in this file: nothing here is urgent enough to
                 # justify TLS traffic during the one window that most needs
                 # the radio left alone). Remote status freshness is a
-                # once-every-30-min concern now, not a 30s one -- see the
+                # once-every-15-min concern now, not a 30s one -- see the
                 # timing comment above.
                 if not state.is_running() and utime.time() - last_cloud_sync >= CLOUD_SYNC_INTERVAL:
                     # Resolve skip state from both sources -- local (this

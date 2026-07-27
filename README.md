@@ -13,7 +13,7 @@ config, and never triggers start/stop — both require being on the same Wi-Fi
 as the Pico. This isn't just a UI restriction: the Firebase security rules
 (below) reject a `zones`/`schedule` write from the app regardless.
 
-The Pico writes to Firebase in one batched pass every 30 minutes (status,
+The Pico writes to Firebase in one batched pass every 15 minutes (status,
 local IP, schedule push, OTA-trigger check) rather than on several independent
 timers — frequent TLS traffic is what wedges the Pico W's onboard WiFi chip,
 so cloud calls are kept rare and batched together. The one exception is
@@ -321,7 +321,7 @@ Check `update_status.json` on the device (via Thonny), or `devices/{id}/update` 
 ### Manual "check now" from the app
 The Dashboard's Device Info card has a "Check for Update" button.
 - **Local mode**: posts directly to the Pico's `/check-update` HTTP endpoint, which runs `check_for_update()` immediately in that request — instant, no Firebase round-trip.
-- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched cloud-sync pass (see Architecture above), so a remote-triggered check can take up to 30 minutes to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same pass.
+- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched cloud-sync pass (see Architecture above), so a remote-triggered check can take up to 15 minutes to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same pass.
 
 ---
 
@@ -330,6 +330,16 @@ The Dashboard's Device Info card has a "Check for Update" button.
 The Pico syncs its clock from NTP at boot, mirrors it into the DS3231 (if wired), and re-syncs automatically **once daily at 3am local time** — the DS3231's own crystal drifts a little over weeks/months of continuous uptime, and this controller is meant to run for a long time between reboots. NTP is plain UDP (port 123), not TLS, so this doesn't compete with the WiFi-chip concerns the rest of this document is careful about — it's fine for this to run on its own schedule, independent of the batched Firebase cloud-sync pass.
 
 **Manual resync**: the Dashboard's Device Info card has a "Resync Time" button, local mode only — it posts directly to the Pico's `POST /resync-time` endpoint for an instant resync. This isn't offered remotely; the daily automatic job already covers the underlying need without a Firebase round-trip.
+
+---
+
+## Boot Diagnostics
+
+Every boot writes `boot_log.json` to the device's flash, readable via `GET /boot-log` on the local network (e.g. `http://<pico-ip>/boot-log` from a browser, or `curl`) — no serial console or physical access required. Useful when the board is somewhere inconvenient to reach (this is local-network only, same as every other endpoint here — it's not reachable from outside your Wi-Fi).
+
+Fields: `firmware_version`, `zones_configured`, `lcd_present`, `rtc_present`, `wifi_connected`, `local_ip`, `wifi_error`, `ntp_synced`, `boot_epoch`, `firebase_auth_ok`, `firebase_auth_error`, `firebase_uid`, `expected_uid_mismatch`, `device_owner_uid_claimed` (`true`/`false`/`null` if never attempted because auth failed), `heap_total_bytes`, `free_mem_bytes_at_boot`.
+
+If the endpoint 404s with "no boot log available yet," the device hasn't rebooted since this feature was added — power-cycle it once.
 
 ---
 
