@@ -10,7 +10,9 @@
 #   POST /skip-today      → set local skip override
 #   POST /cancel-skip     → clear local skip override
 #   POST /check-update    → trigger an immediate OTA check (bypasses the
-#                           hourly cloud-sync pass main.py otherwise waits for)
+#                           30-min cloud-sync pass main.py otherwise waits for)
+#   POST /resync-time     → trigger an immediate NTP resync (also runs
+#                           automatically once daily at 3am local time)
 
 import ujson
 import usocket
@@ -122,8 +124,8 @@ def _parse_request(raw):
 
 
 def run_server(config, state, rtc, on_manual_start, on_manual_stop,
-               local_override, local_update_trigger, save_config_fn, now_fn,
-               firmware_version):
+               local_override, local_update_trigger, local_resync_trigger,
+               save_config_fn, now_fn, firmware_version):
     addr = usocket.getaddrinfo("0.0.0.0", 80)[0][-1]
     server = usocket.socket()
     server.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
@@ -207,6 +209,10 @@ def run_server(config, state, rtc, on_manual_start, on_manual_stop,
 
             elif method == "POST" and path == "/check-update":
                 local_update_trigger["requested"] = True
+                _json_response(conn, 200, {"requested": True})
+
+            elif method == "POST" and path == "/resync-time":
+                local_resync_trigger["requested"] = True
                 _json_response(conn, 200, {"requested": True})
 
             else:

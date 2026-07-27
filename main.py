@@ -123,6 +123,31 @@ def get_now_date_string():
     return "{:04d}-{:02d}-{:02d}".format(t[0], t[1], t[2])
 
 
+def sync_time_from_ntp():
+    """Sync utime's clock from NTP and mirror it into the DS3231 (if
+    present). Used at boot, once daily at 3am local time, and via the local
+    /resync-time endpoint -- see the main loop's "Daily NTP resync" section.
+
+    Plain UDP NTP (port 123), not TLS -- this doesn't compete for the WiFi
+    budget the batched cloud-sync pass is careful about, so it's safe to run
+    this more often than the Firebase calls elsewhere in this file. It still
+    only actually runs once daily automatically, since the DS3231's drift
+    over a single day is negligible -- daily is just cheap insurance against
+    it accumulating over weeks/months of continuous uptime without a reboot.
+
+    Returns True on success."""
+    try:
+        import ntptime
+        ntptime.settime()
+        if rtc is not None:
+            t = utime.localtime(unix_time())  # UTC fields, no offset applied
+            rtc.set_datetime(t[0], t[1], t[2], t[3], t[4], t[5], t[6] + 1)
+        return True
+    except Exception as ex:
+        print("NTP sync failed (non-fatal):", ex)
+        return False
+
+
 def _format_ip_version(ip, version):
     """Fit "<ip> v<version>" into the LCD's 16-char bottom row. If the
     full IP doesn't leave room for the version, shorten it to its last
@@ -205,8 +230,12 @@ def on_manual_stop():
 local_override = {"skip_today": False, "skip_reason": None}
 
 # Set by web/server.py's /check-update endpoint so a local LAN user gets an
-# instant OTA check instead of waiting for the hourly cloud-sync pass.
+# instant OTA check instead of waiting for the 30-min cloud-sync pass.
 local_update_trigger = {"requested": False}
+
+# Set by web/server.py's /resync-time endpoint for an instant manual NTP
+# resync from the app, on top of the automatic daily 3am one (see main loop).
+local_resync_trigger = {"requested": False}
 
 # ---------------------------------------------------------------------------
 # HTTP server thread
@@ -222,6 +251,7 @@ def start_web_server():
             on_manual_stop=on_manual_stop,
             local_override=local_override,
             local_update_trigger=local_update_trigger,
+            local_resync_trigger=local_resync_trigger,
             save_config_fn=save_config,
             now_fn=get_now_epoch,
             firmware_version=firmware_version,
@@ -304,22 +334,17 @@ def main():
     # --- NTP time sync ---
     # Without this, utime.time() stays at its arbitrary boot-time default
     # instead of the real date, and every timestamp sent to Firebase/the
-    # app (heartbeats, run times) will be meaningless.
-    try:
-        import ntptime
-        ntptime.settime()
-        print("NTP: time synced")
-
-        # Keep the DS3231 in true UTC too, so it agrees with unix_time()
-        # whenever Wi-Fi is down and get_now_epoch() falls back to it. This
-        # replaces manually running set_rtc_once.py -- and fixes it if that
-        # script was ever run with the wrong value.
-        if rtc is not None:
-            t = utime.localtime(unix_time())  # UTC fields, no offset applied
-            rtc.set_datetime(t[0], t[1], t[2], t[3], t[4], t[5], t[6] + 1)
-            print("RTC: synced from NTP to", rtc.iso_string())
-    except Exception as ex:
-        print("NTP: sync failed (non-fatal):", ex)
+    # app (heartbeats, run times) will be meaningless. Also re-synced once
+    # daily at 3am local time and on-demand via /resync-time (see main loop
+    # and sync_time_from_ntp()) -- the DS3231's own crystal drifts a little
+    # over weeks/months of continuous uptime, and this device is meant to
+    # run for a long time between reboots.
+    if sync_time_from_ntp():
+        print("NTP: time synced" + (
+            ", RTC synced to {}".format(rtc.iso_string()) if rtc else ""))
+        last_ntp_sync_date = get_now_date_string()
+    else:
+        last_ntp_sync_date = None  # force a retry the moment 3am next comes around
     wdt.feed()
 
     # --- Firebase ---
@@ -369,14 +394,13 @@ def main():
     status_writer   = StatusWriter(fb, state, config, firmware_version,
                                    config.get("device_name", "LetItRain Controller"))
     override_reader = OverrideReader(fb)
-    schedule_sync   = ScheduleSync(fb, config, save_config)
+    schedule_sync   = ScheduleSync(fb, config)
 
     update_pending = False
 
     if firebase_ok:
         try:
-            schedule_sync.push_initial()   # seed Firebase if empty
-            schedule_sync.sync()           # pull latest schedule/zones
+            schedule_sync.push()   # mirror local zones/schedule to Firebase
             status_led.set_mode("running")
         except Exception as ex:
             print("Firebase boot sync failed (non-fatal):", ex)
@@ -418,12 +442,12 @@ def main():
     # independent timers (status/schedule/IP/OTA-poll, each 30-300s) meant
     # this board was doing a TLS handshake every 15-20s combined at idle,
     # which is what wedges the Pico W's CYW43 WiFi chip. Collapsed into one
-    # batched pass on a single relaxed clock: status, IP, schedule pull, and
-    # OTA-trigger check all fire together once an hour instead of on their
+    # batched pass on a single relaxed clock: status, IP, schedule push, and
+    # OTA-trigger check all fire together every 30 min instead of on their
     # own clocks all day. Run-completion data isn't delayed by this --
     # push_last_run() (see stop_run()) still fires immediately and
     # separately the moment a run actually ends.
-    CLOUD_SYNC_INTERVAL = 3600
+    CLOUD_SYNC_INTERVAL = 1800  # 30 min -- still ~60x fewer handshakes than the old combined cadence
 
     # wdt was already armed right after Wi-Fi settled, above -- from here
     # on it's fed after each section below (cloud sync, ...) and every 100ms
@@ -518,11 +542,30 @@ def main():
                             start_run(zone_id, duration_seconds, "scheduled")
                             last_run_slots[slot_key] = local_epoch
 
+                # --- Daily NTP resync (3am local) + manual trigger ---
+                # Plain UDP NTP -- not TLS -- so unlike everything else in
+                # this file it isn't a wedge risk and doesn't need batching
+                # or a relaxed interval. Runs once automatically each day to
+                # catch the DS3231's crystal drifting over weeks/months of
+                # continuous uptime, or instantly on request via the app's
+                # local /resync-time button. The hour-wide window (not an
+                # exact-minute check) means a run spanning all of 3:00-3:59
+                # is the only way a day gets skipped -- it just tries again
+                # at 3am the next day.
+                local_hour = utime.localtime(local_epoch)[3]
+                due_daily_resync = (local_hour == 3 and last_ntp_sync_date != now_date_string)
+                if not state.is_running() and (due_daily_resync or local_resync_trigger["requested"]):
+                    local_resync_trigger["requested"] = False
+                    if sync_time_from_ntp():
+                        last_ntp_sync_date = now_date_string
+                        print("NTP: resynced ({})".format(
+                            "daily 3am" if due_daily_resync else "manual"))
+                    wdt.feed()
+
                 # --- Local "check for update now" trigger ---
                 # Separate from the batched cloud-sync pass below and not
-                # gated on its hourly clock, so tapping "Check for Update"
-                # while on the LAN still feels instant instead of waiting
-                # up to an hour.
+                # gated on its clock, so tapping "Check for Update" while on
+                # the LAN still feels instant instead of waiting up to 30 min.
                 if (local_update_trigger["requested"] and not state.is_running()
                         and not update_pending):
                     local_update_trigger["requested"] = False
@@ -541,8 +584,8 @@ def main():
                 # as elsewhere in this file: nothing here is urgent enough to
                 # justify TLS traffic during the one window that most needs
                 # the radio left alone). Remote status freshness is a
-                # once-an-hour concern now, not a 30s one -- see the timing
-                # comment above.
+                # once-every-30-min concern now, not a 30s one -- see the
+                # timing comment above.
                 if not state.is_running() and utime.time() - last_cloud_sync >= CLOUD_SYNC_INTERVAL:
                     # Resolve skip state from both sources -- local (this
                     # boot's in-memory override) and remote (Firebase
@@ -586,11 +629,9 @@ def main():
                             print("Firebase push_ip failed (non-fatal):", ex)
 
                     try:
-                        schedule_sync.sync()
-                        # If zones changed, re-init relay controller would need reboot
-                        # For now: log a note; zone hardware changes require reboot
+                        schedule_sync.push()   # keep Firebase's read-only mirror current
                     except Exception as ex:
-                        print("Schedule sync failed (non-fatal):", ex)
+                        print("Schedule sync push failed (non-fatal):", ex)
 
                     if not update_pending and fb.id_token:
                         try:

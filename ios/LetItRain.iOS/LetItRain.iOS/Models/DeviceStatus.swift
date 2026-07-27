@@ -19,13 +19,14 @@ struct DeviceStatus: Codable {
     var firmwareVersion:   String?
 
     var isRecentlyOnline: Bool {
-        // Local polling refreshes this every 30s, so staleness there is
-        // never more than a poll or two. Remotely, the Pico only syncs to
-        // Firebase once an hour (CLOUD_SYNC_INTERVAL in main.py) -- kept
-        // deliberately infrequent so it doesn't wedge the Pico W's WiFi
-        // chip with constant TLS traffic. 2x that (2h) absorbs a missed or
-        // late cycle without flickering "offline" between normal syncs.
-        Date().timeIntervalSince1970 - lastSyncedEpoch < 7200
+        // Locally this refreshes on every direct request (view appear, an
+        // action, a mode change), so staleness there is never more than a
+        // moment. Remotely, the Pico only syncs to Firebase every 30 min
+        // (CLOUD_SYNC_INTERVAL in main.py) -- kept deliberately infrequent
+        // so it doesn't wedge the Pico W's WiFi chip with constant TLS
+        // traffic. 2x that (1h) absorbs a missed or late cycle without
+        // flickering "offline" between normal syncs.
+        Date().timeIntervalSince1970 - lastSyncedEpoch < 3600
     }
 
     var remainingSeconds: TimeInterval? {

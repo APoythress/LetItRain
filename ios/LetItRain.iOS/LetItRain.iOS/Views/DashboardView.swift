@@ -375,9 +375,25 @@ struct DashboardView: View {
             }
 
             updateRow
+            if connectionManager.mode.isLocal { resyncTimeRow }
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(hex: "0F2038")).cornerRadius(16)
+    }
+
+    // MARK: - Clock resync row (local only -- the daily 3am job covers remote)
+
+    private var resyncTimeRow: some View {
+        HStack {
+            Text("Clock drifted?").font(.subheadline).foregroundColor(.white.opacity(0.5))
+            Spacer()
+            Button {
+                deviceVM.resyncTime()
+            } label: {
+                Text("Resync Time").font(.caption.weight(.semibold))
+            }
+            .disabled(deviceVM.isLoading)
+        }
     }
 
     // MARK: - OTA update row

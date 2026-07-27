@@ -13,14 +13,25 @@ config, and never triggers start/stop — both require being on the same Wi-Fi
 as the Pico. This isn't just a UI restriction: the Firebase security rules
 (below) reject a `zones`/`schedule` write from the app regardless.
 
-The Pico writes to Firebase in one batched pass roughly once an hour (status,
-local IP, schedule pull, OTA-trigger check) rather than on several independent
+The Pico writes to Firebase in one batched pass every 30 minutes (status,
+local IP, schedule push, OTA-trigger check) rather than on several independent
 timers — frequent TLS traffic is what wedges the Pico W's onboard WiFi chip,
 so cloud calls are kept rare and batched together. The one exception is
 `push_last_run()`, which still fires immediately whenever a run actually
-stops, so "last ran" doesn't wait for the next hourly sync. It reads the
+stops, so "last ran" doesn't wait for the next sync. It reads the
 `overrides` node to check for skip signals. Firebase is never in the command
 path for relay control.
+
+The iOS app itself doesn't poll the Pico on a timer either, for the same
+reason: on the local network, it fetches status once when a screen appears,
+once after any action (start/stop/skip), and once whenever it detects it's
+just joined the local network — not continuously in the background. A
+running zone's countdown needs no polling at all, since it's computed
+client-side from the fetched end time. Local/remote detection itself only
+re-runs on a network change, an app foreground, or a failed request — not a
+recurring timer — since two independent background timers (one for
+connectivity, one for status) both polling the Pico's single-threaded HTTP
+server used to occasionally collide and produce spurious "offline" flips.
 
 **Safety net:** a hardware watchdog (`machine.WDT`, 8s timeout) is armed once boot completes. It's fed after each network operation in the main loop and every 100ms while idle — if the loop ever stops reaching those points for 8 seconds (a hang of any kind, regardless of cause), the board hard-resets. `relay.all_off()` unconditionally runs first on every boot, so a stuck-open zone always gets shut off within seconds even if the software issue that caused the hang is never diagnosed.
 
@@ -150,6 +161,8 @@ Whether it's your own first device or a friend's, the steps are the same — thi
 5. In Realtime Database → Data, **manually set `users/{their_personal_uid}/device_id = "{their_device_id}"`**. This is the one step that must be done from the Console — the rules deliberately don't allow the app to write this field itself (see the security rules note above), since that's what stops one person from granting themselves access to someone else's device.
 
 After step 5, their app shows only their own device's status/schedule, and their Pico only ever reads/writes its own node — cross-device access is rejected by the rules regardless of what either side's code does.
+
+**If the app is stuck showing "Your account isn't assigned to a device yet"** — this is always step 5 above not having been done yet for that account (or done for the wrong UID). This applies to your own first device too, not just friends' — signing into the app does *not* automatically grant it access to anything; someone has to go into the Console and set `users/{your_personal_uid}/device_id` by hand, exactly once. Note this is a **different** field from `devices/{device_id}/device_owner_uid` (which the Pico sets on itself, automatically, and which you should not need to touch by hand) — mixing the two up is easy to do and won't fix this error.
 
 ### 1. Fill in secrets.py
 Edit `secrets.py` and replace every `REPLACE_ME` value:
@@ -308,7 +321,15 @@ Check `update_status.json` on the device (via Thonny), or `devices/{id}/update` 
 ### Manual "check now" from the app
 The Dashboard's Device Info card has a "Check for Update" button.
 - **Local mode**: posts directly to the Pico's `/check-update` HTTP endpoint, which runs `check_for_update()` immediately in that request — instant, no Firebase round-trip.
-- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched hourly cloud-sync pass (see Architecture above), so a remote-triggered check can take up to an hour to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same hourly pass.
+- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched cloud-sync pass (see Architecture above), so a remote-triggered check can take up to 30 minutes to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same pass.
+
+---
+
+## Clock Sync
+
+The Pico syncs its clock from NTP at boot, mirrors it into the DS3231 (if wired), and re-syncs automatically **once daily at 3am local time** — the DS3231's own crystal drifts a little over weeks/months of continuous uptime, and this controller is meant to run for a long time between reboots. NTP is plain UDP (port 123), not TLS, so this doesn't compete with the WiFi-chip concerns the rest of this document is careful about — it's fine for this to run on its own schedule, independent of the batched Firebase cloud-sync pass.
+
+**Manual resync**: the Dashboard's Device Info card has a "Resync Time" button, local mode only — it posts directly to the Pico's `POST /resync-time` endpoint for an instant resync. This isn't offered remotely; the daily automatic job already covers the underlying need without a Firebase round-trip.
 
 ---
 
