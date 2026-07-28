@@ -1,13 +1,8 @@
 {
-  "version": "1.3.6",
+  "version": "1.3.10",
   "files": [
     { "path": "main.py" },
-    { "path": "hardware/lcd1602.py" },
-    { "path": "netcfg/wifi.py" },
-    { "path": "firebase/client.py" },
-    { "path": "firebase/status_writer.py" },
-    { "path": "firebase/override_reader.py" },
-    { "path": "firebase/schedule_sync.py" },
-    { "path": "web/server.py" }
+    { "path": "version.json"},
+    { "path": "firebase/schedule_sync.py" }
   ]
 }

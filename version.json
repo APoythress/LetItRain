@@ -1,4 +1,4 @@
 {
-  "version": "1.3.6",
-  "notes": "Fixes hardware/lcd1602.py's shift-register bit mapping -- every signal (RS/Enable/D4-D7/backlight) was one bit position higher than this backpack actually wires, verified against Adafruit's own character_lcd_spi.py reference. Backlight bit wasn't reaching the backlight circuit at all; explains uninitialized blank display + dead backlight despite correct wiring/orientation/SPI-enable-bridge."
+  "version": "1.3.10",
+  "notes": "IMPORTANT fix to 1.3.9's own diagnostic: checkpoint.json was being written every ~5s on every main-loop pass (not just during a start), which risked filesystem corruption if a reset landed mid-write on a device that already resets unpredictably -- likely why the board became fully unresponsive for 10+ minutes after 1.3.9, worse than the bug it was meant to diagnose. Checkpoint writes are now limited to the 5 rare points inside start_run() only."
 }

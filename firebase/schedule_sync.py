@@ -24,15 +24,21 @@ class ScheduleSync:
 
     def push(self):
         """
-        Push current local zones + schedule to Firebase. Call at boot and
-        during the periodic cloud-sync pass. Cheap enough to run
-        unconditionally rather than diffing first -- it's two requests,
-        once an hour.
-        """
-        self._push_zones_to_firebase()
-        self._push_schedule_to_firebase()
+        Push current local zones + schedule to Firebase -- two separate
+        requests. Cheap enough to run unconditionally rather than diffing
+        first -- it's two requests, every 15 min.
 
-    def _push_schedule_to_firebase(self):
+        Prefer calling push_zones()/push_schedule() individually (with a
+        wdt.feed() between them) from the main loop's cloud-sync pass --
+        each is its own network request that can legitimately take a few
+        seconds, and this convenience wrapper doesn't feed between them.
+        Only use push() somewhere already wrapped by feeds close enough
+        together not to matter (e.g. right after boot-time Firebase auth).
+        """
+        self.push_zones()
+        self.push_schedule()
+
+    def push_schedule(self):
         schedule = self._config.get("schedule", {})
         # Convert slots lists to dicts for Firebase (Firebase prefers indexed children)
         fb_schedule = {}
@@ -47,7 +53,7 @@ class ScheduleSync:
         else:
             print("ScheduleSync: schedule push failed (non-fatal) -- see patch() error above")
 
-    def _push_zones_to_firebase(self):
+    def push_zones(self):
         zones = self._config.get("zones", [])
         fb_zones = {str(z["id"]): {
             "name":    z.get("name", "Zone {}".format(z["id"])),

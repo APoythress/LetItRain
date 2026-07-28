@@ -15,7 +15,9 @@
 import utime
 import gc
 import ujson
+import os
 import _thread
+import machine
 from machine import I2C, Pin, reset, WDT
 
 import secrets
@@ -104,14 +106,44 @@ last_run_slots = {}
 # Time helpers
 # ---------------------------------------------------------------------------
 
+_rtc_lock = _thread.allocate_lock()
+
+
 def get_now_epoch():
     """True UTC epoch — used for Firebase timestamps, run-duration math, and
     anything the app compares against Date().timeIntervalSince1970. The
     DS3231 (when present) is kept synced to UTC via NTP at boot, so both
-    branches below return the same true-UTC convention."""
+    branches below return the same true-UTC convention.
+
+    Locked around the actual I2C read: this is called from both the main
+    loop thread and the HTTP server thread (start_run()/stop_run() call it
+    on a manual start/stop, which runs on the HTTP thread) -- the RP2040's
+    I2C peripheral is a single piece of shared hardware, and two cores
+    hitting it at the same instant with no synchronization can wedge the
+    bus. If that stalls whichever thread is feeding the watchdog, the whole
+    board hard-resets a few seconds later -- which looks exactly like "the
+    relay turns off almost immediately" from the outside, since
+    relay.all_off() runs first on every boot, but stop_run() (which is what
+    would normally record last_run) never got to execute."""
     if rtc:
-        return to_unix(rtc.epoch())
+        _rtc_lock.acquire()
+        try:
+            return to_unix(rtc.epoch())
+        finally:
+            _rtc_lock.release()
     return unix_time()
+
+
+def _reset_cause_name():
+    """Human-readable reason for the last reset (e.g. "wdt_reset"),
+    written to boot_log.json so a reset can be confirmed/diagnosed
+    remotely via GET /boot-log instead of needing to catch it live on a
+    serial console."""
+    cause = machine.reset_cause()
+    for name in ("WDT_RESET", "PWRON_RESET", "HARD_RESET", "SOFT_RESET", "DEEPSLEEP_RESET"):
+        if cause == getattr(machine, name, object()):
+            return name.lower()
+    return "unknown({})".format(cause)
 
 
 def get_local_wall_clock_epoch():
@@ -169,6 +201,43 @@ def _write_boot_log(log):
         print("Boot log write failed (non-fatal):", ex)
 
 
+_CHECKPOINT_FILE = "checkpoint.json"
+
+
+def _set_checkpoint(name):
+    """TEMPORARY diagnostic for the manual-start-crash investigation --
+    safe to remove once the root cause is confirmed. Written synchronously
+    (not batched) right before anything that could plausibly be what a
+    watchdog reset catches mid-call, so the NEXT boot's boot_log.json can
+    show exactly what was in flight the instant before the reset --
+    without needing a live serial connection, same as the rest of
+    boot_log.json. Best-effort: a failed write here should never affect
+    the run itself."""
+    try:
+        with open(_CHECKPOINT_FILE, "w") as f:
+            ujson.dump({"checkpoint": name, "at": utime.time()}, f)
+    except Exception:
+        pass
+
+
+def _read_and_clear_checkpoint():
+    """Read (and delete) whatever checkpoint was last written, if any --
+    called once at boot, before anything else has a chance to overwrite
+    it. None if the board shut down cleanly (or the file was never
+    written this boot cycle)."""
+    checkpoint = None
+    try:
+        with open(_CHECKPOINT_FILE, "r") as f:
+            checkpoint = ujson.load(f)
+    except Exception:
+        pass
+    try:
+        os.remove(_CHECKPOINT_FILE)
+    except Exception:
+        pass
+    return checkpoint
+
+
 def _format_ip_version(ip, version):
     """Fit "<ip> v<version>" into the LCD's 16-char bottom row. If the
     full IP doesn't leave room for the version, shorten it to its last
@@ -193,12 +262,17 @@ def _format_ip_version(ip, version):
 
 def start_run(zone_id, duration_seconds, mode):
     """Start a zone. If another zone is running, stop it first."""
+    _set_checkpoint("start_run_entry")
     if state.is_running():
         _stop_relay_for_current_zone()
+    _set_checkpoint("start_run_before_get_now_epoch")
     now_epoch = get_now_epoch()
+    _set_checkpoint("start_run_before_relay_on")
     relay.on(zone_id)
+    _set_checkpoint("start_run_before_state_start")
     state.start_run(now_epoch, duration_seconds, mode, zone_id)
     print("Run started: zone={} mode={} duration={}s".format(zone_id, mode, duration_seconds))
+    _set_checkpoint("start_run_done")
 
 
 def _stop_relay_for_current_zone():
@@ -298,6 +372,19 @@ firmware_version = None
 def main():
     global status_writer, override_reader, schedule_sync, firmware_version
 
+    # Captured immediately: reflects the previous boot's reset regardless of
+    # when it's read, but reading it early keeps it clearly separated from
+    # anything below that could theoretically also touch machine state.
+    boot_reset_cause = _reset_cause_name()
+
+    # Read (and clear) before anything else has a chance to overwrite it --
+    # see _set_checkpoint()'s docstring. TEMPORARY diagnostic, see there.
+    last_checkpoint = _read_and_clear_checkpoint()
+    if last_checkpoint:
+        print("Last checkpoint before this boot: {} (age {}s)".format(
+            last_checkpoint.get("checkpoint"),
+            utime.time() - last_checkpoint.get("at", utime.time())))
+
     # Single source of truth for the running version: whatever the OTA
     # updater last wrote to version.json. This keeps the displayed version
     # in sync automatically after every successful update, with no separate
@@ -305,14 +392,18 @@ def main():
     firmware_version = get_local_version()
 
     print("LetItRain v{} booting...".format(firmware_version))
+    print("Boot #reset cause:", boot_reset_cause)
     print("Zones configured:", relay.zone_ids())
 
     # Boot diagnostics, written to boot_log.json at the end of boot (see
     # _write_boot_log() below) and readable via GET /boot-log -- the primary
     # way to check Wi-Fi/Firebase/RTC boot status without physical/serial
-    # access to the board.
+    # access to the board. reset_cause specifically answers "did the board
+    # just watchdog-reset?" (wdt_reset) vs. a normal power-on (pwron_reset).
     boot_log = {
         "firmware_version": firmware_version,
+        "reset_cause":      boot_reset_cause,
+        "last_checkpoint":  last_checkpoint,  # TEMPORARY diagnostic, see _set_checkpoint()
         "zones_configured": relay.zone_ids(),
         "lcd_present":      lcd_status is not None,
         "rtc_present":      rtc is not None,
@@ -476,12 +567,21 @@ def main():
     update_pending = False
 
     if firebase_ok:
+        # Each push is its own network request (up to 8s) -- fed
+        # individually rather than once after both, same reasoning as the
+        # main loop's cloud-sync pass below.
         try:
-            schedule_sync.push()   # mirror local zones/schedule to Firebase
+            schedule_sync.push_zones()
             status_led.set_mode("running")
         except Exception as ex:
-            print("Firebase boot sync failed (non-fatal):", ex)
+            print("Firebase boot sync (zones) failed (non-fatal):", ex)
             status_led.set_mode("no_internet")
+        wdt.feed()
+
+        try:
+            schedule_sync.push_schedule()
+        except Exception as ex:
+            print("Firebase boot sync (schedule) failed (non-fatal):", ex)
         wdt.feed()
 
         # Pushed in its own try block: the app relies on meta/local_ip to know
@@ -667,6 +767,19 @@ def main():
                 # the radio left alone). Remote status freshness is a
                 # once-every-15-min concern now, not a 30s one -- see the
                 # timing comment above.
+                #
+                # IMPORTANT: this block does 6+ sequential Firebase calls,
+                # each individually allowed up to 8s (see firebase/client.py's
+                # _REQUEST_TIMEOUT). A single wdt.feed() at the end of the
+                # whole block (as this used to be) means the *cumulative*
+                # time across all of them -- not any single call -- is what
+                # has to stay under the 8s watchdog deadline, which is very
+                # easy to blow past even when no individual call is slow
+                # enough to time out on its own. Since last_cloud_sync starts
+                # at 0, this whole block also always fires on the very first
+                # main-loop pass after every boot, making this the single
+                # highest-risk moment for exactly that kind of reset. Feed
+                # after every individual call below, not just once at the end.
                 if not state.is_running() and utime.time() - last_cloud_sync >= CLOUD_SYNC_INTERVAL:
                     # Resolve skip state from both sources -- local (this
                     # boot's in-memory override) and remote (Firebase
@@ -683,6 +796,7 @@ def main():
                             skip_active, skip_reason = override_reader.get_active_skip(now_date_string)
                         except Exception as ex:
                             print("Override read for status display failed (non-fatal):", ex)
+                    wdt.feed()
 
                     try:
                         status_writer.push_status(
@@ -693,6 +807,7 @@ def main():
                     except Exception as ex:
                         print("Firebase status push failed (non-fatal):", ex)
                         status_led.set_mode("no_internet")
+                    wdt.feed()
 
                     if wlan is not None and wlan.isconnected():
                         try:
@@ -708,22 +823,34 @@ def main():
                                 status_writer.push_ip(local_ip)
                         except Exception as ex:
                             print("Firebase push_ip failed (non-fatal):", ex)
+                    wdt.feed()
 
                     try:
-                        schedule_sync.push()   # keep Firebase's read-only mirror current
+                        schedule_sync.push_zones()   # keep Firebase's read-only mirror current
                     except Exception as ex:
-                        print("Schedule sync push failed (non-fatal):", ex)
+                        print("Schedule sync (zones) push failed (non-fatal):", ex)
+                    wdt.feed()
+
+                    try:
+                        schedule_sync.push_schedule()
+                    except Exception as ex:
+                        print("Schedule sync (schedule) push failed (non-fatal):", ex)
+                    wdt.feed()
 
                     if not update_pending and fb.id_token:
                         try:
                             update_info = fb.get("update") or {}
+                            wdt.feed()
                             if update_info.get("requested"):
                                 fb.patch("update", {"requested": False})  # clear so it fires once
+                                wdt.feed()
                                 if lcd_status:
                                     lcd_status.show_message("Updating")
                                 update_pending = check_for_update(FIREBASE_STORAGE_BUCKET, fb.id_token)
+                                wdt.feed()
                         except Exception as ex:
                             print("OTA trigger check failed (non-fatal):", ex)
+                    wdt.feed()
 
                     # Skip the push entirely when nothing changed -- this is
                     # "idle" nearly every tick in normal operation, and every
