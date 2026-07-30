@@ -32,7 +32,7 @@ class OverrideReader:
         """
         self._fb = firebase_client
 
-    def get_active_skip(self, today_date_string):
+    async def get_active_skip(self, today_date_string):
         """
         Check whether today's scheduled run should be skipped.
 
@@ -46,7 +46,7 @@ class OverrideReader:
             skip_reason  — "manual_remote" | "rain" | "manual_local" | None
         """
         try:
-            data = self._fb.get("overrides")
+            data = await self._fb.get("overrides")
         except Exception as ex:
             print("OverrideReader: get exception:", ex)
             return False, None  # fail open
@@ -62,8 +62,8 @@ class OverrideReader:
         skip_until = data.get("skip_until")
         # skip_until is an inclusive "YYYY-MM-DD" end date -- ISO date
         # strings sort correctly under plain string comparison, so this
-        # needs no date-math library on MicroPython. Missing/malformed
-        # skip_until is treated as already expired (fail toward watering).
+        # needs no date-math library. Missing/malformed skip_until is
+        # treated as already expired (fail toward watering).
         if not skip_until or today_date_string > skip_until:
             return False, None
 
@@ -81,6 +81,6 @@ class OverrideReader:
         #         return False, None
         # ----------------------------------------------------------------
 
-        print("OverrideReader: skip active until {} — reason: {}".format(
+        print("OverrideReader: skip active until {} - reason: {}".format(
             skip_until, skip_reason))
         return True, skip_reason

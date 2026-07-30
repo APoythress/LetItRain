@@ -113,17 +113,37 @@ final class FirebaseRepository: ObservableObject {
     // MARK: - Snapshot merging
 
     private func mergeZonesSnapshot(_ snap: DataSnapshot) {
-        guard let dict = snap.value as? [String: Any] else { return }
         var zones: [ZoneConfig] = []
-        for (key, val) in dict {
-            guard let id = Int(key), let v = val as? [String: Any] else { continue }
-            zones.append(ZoneConfig(
-                id:      id,
-                name:    v["name"]    as? String ?? "Zone \(id)",
-                pin:     v["pin"]     as? Int    ?? 0,
-                enabled: v["enabled"] as? Bool   ?? false
-            ))
+
+        if let dict = snap.value as? [String: Any] {
+            for (key, val) in dict {
+                guard let id = Int(key), let v = val as? [String: Any] else { continue }
+                zones.append(ZoneConfig(
+                    id:      id,
+                    name:    v["name"]    as? String ?? "Zone \(id)",
+                    pin:     v["pin"]     as? Int    ?? 0,
+                    enabled: v["enabled"] as? Bool   ?? false
+                ))
+            }
+        } else if let arr = snap.value as? [Any] {
+            // Firebase coerces a node whose keys are purely sequential
+            // numeric strings ("1".."5") into a JSON array instead of an
+            // object -- index 0 is a null placeholder since there's no
+            // zone id 0. Same quirk mergeScheduleSnapshot's slots parsing
+            // below already accounts for; zones just needs it too.
+            for (id, val) in arr.enumerated() {
+                guard let v = val as? [String: Any] else { continue }
+                zones.append(ZoneConfig(
+                    id:      id,
+                    name:    v["name"]    as? String ?? "Zone \(id)",
+                    pin:     v["pin"]     as? Int    ?? 0,
+                    enabled: v["enabled"] as? Bool   ?? false
+                ))
+            }
+        } else {
+            return
         }
+
         zones.sort { $0.id < $1.id }
         var current = config ?? .defaultConfig
         current.zones      = zones

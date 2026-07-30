@@ -1,0 +1,1 @@
+{"firmware_version": "2.0.0-alpha", "zones_configured": [1, 5], "lcd_present": false, "rtc_present": false, "local_ip": "192.168.1.233", "network_reachable": true, "firebase_auth_ok": true, "firebase_auth_error": null, "firebase_uid": "PKqfQxhxiBbLlH6ZOLVRREsdZ122", "expected_uid_mismatch": false, "device_owner_uid_claimed": true}

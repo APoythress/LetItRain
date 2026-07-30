@@ -1,7 +1,7 @@
 # hardware/status_led.py
 # Dual-color status LED, driven by explicit polling (call .tick() often)
-# rather than machine.Timer — timer callbacks were not firing reliably
-# alongside the _thread-based HTTP server on this board/firmware.
+# -- same polling design as the MicroPython build, now driven by an
+# asyncio task in main.py instead of the main loop's manual tick loop.
 #
 # Modes:
 #   "booting"     green flashes on 3s / off 1s   red off
@@ -9,8 +9,8 @@
 #   "no_internet" green solid on                   red flashes on 5s / off 2s
 #   "boot_failed" green off                        red flashes rapidly, on 150ms / off 150ms
 
-import utime
-from machine import Pin
+import time
+from gpiozero import OutputDevice
 
 # (on_ms, off_ms) per LED per mode. True = solid on, False/None = off.
 _PATTERNS = {
@@ -31,20 +31,20 @@ class StatusLED:
     """
 
     def __init__(self, green_pin, red_pin):
-        self._green = Pin(green_pin, Pin.OUT)
-        self._red   = Pin(red_pin, Pin.OUT)
-        self._green.value(0)
-        self._red.value(0)
+        self._green = OutputDevice(green_pin)
+        self._red   = OutputDevice(red_pin)
+        self._green.off()
+        self._red.off()
 
         self._mode            = None
-        self._mode_started_ms = utime.ticks_ms()
+        self._mode_started    = time.monotonic()
 
     def set_mode(self, mode):
         if mode not in _PATTERNS:
             raise ValueError("Unknown LED mode: {}".format(mode))
         if mode != self._mode:
-            self._mode            = mode
-            self._mode_started_ms = utime.ticks_ms()
+            self._mode         = mode
+            self._mode_started = time.monotonic()
             self.tick()   # apply immediately so solid on/off modes show right away
 
     def tick(self):
@@ -52,16 +52,19 @@ class StatusLED:
         pattern = _PATTERNS.get(self._mode)
         if not pattern:
             return
-        elapsed = utime.ticks_diff(utime.ticks_ms(), self._mode_started_ms)
-        self._apply(self._green, pattern["green"], elapsed)
-        self._apply(self._red, pattern["red"], elapsed)
+        elapsed_ms = (time.monotonic() - self._mode_started) * 1000
+        self._apply(self._green, pattern["green"], elapsed_ms)
+        self._apply(self._red, pattern["red"], elapsed_ms)
 
     @staticmethod
-    def _apply(pin, spec, elapsed_ms):
+    def _apply(device, spec, elapsed_ms):
         if spec is True:
-            pin.value(1)
+            device.on()
         elif spec is False or spec is None:
-            pin.value(0)
+            device.off()
         else:
             on_ms, off_ms = spec
-            pin.value(1 if (elapsed_ms % (on_ms + off_ms)) < on_ms else 0)
+            if (elapsed_ms % (on_ms + off_ms)) < on_ms:
+                device.on()
+            else:
+                device.off()

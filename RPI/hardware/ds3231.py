@@ -1,4 +1,9 @@
-from machine import I2C
+# hardware/ds3231.py
+# DS3231 RTC driver over smbus2 (replaces machine.I2C). The BCD encode/
+# decode logic is unchanged -- it was already plain Python with no
+# MicroPython dependency.
+
+import calendar
 
 DS3231_ADDR = 0x68
 
@@ -9,12 +14,17 @@ def _dec_to_bcd(value):
     return ((value // 10) << 4) | (value % 10)
 
 class DS3231:
-    def __init__(self, i2c, address=DS3231_ADDR):
-        self.i2c = i2c
+    def __init__(self, bus, address=DS3231_ADDR):
+        """
+        Args:
+            bus: an open smbus2.SMBus instance (e.g. SMBus(1) for the Pi's
+                 I2C-1 bus on GPIO2/GPIO3).
+        """
+        self.bus = bus
         self.address = address
 
     def datetime_tuple(self):
-        data = self.i2c.readfrom_mem(self.address, 0x00, 7)
+        data = self.bus.read_i2c_block_data(self.address, 0x00, 7)
         second = _bcd_to_dec(data[0] & 0x7F)
         minute = _bcd_to_dec(data[1] & 0x7F)
         hour = _bcd_to_dec(data[2] & 0x3F)
@@ -25,7 +35,7 @@ class DS3231:
         return (year, month, day, hour, minute, second, weekday)
 
     def set_datetime(self, year, month, day, hour, minute, second, weekday=1):
-        payload = bytes([
+        payload = [
             _dec_to_bcd(second),
             _dec_to_bcd(minute),
             _dec_to_bcd(hour),
@@ -33,19 +43,16 @@ class DS3231:
             _dec_to_bcd(day),
             _dec_to_bcd(month),
             _dec_to_bcd(year - 2000),
-        ])
-        self.i2c.writeto_mem(self.address, 0x00, payload)
+        ]
+        self.bus.write_i2c_block_data(self.address, 0x00, payload)
 
     def epoch(self):
-        import utime
+        # The DS3231 is kept in UTC (see main.py), so its fields must be
+        # interpreted as UTC, not the host's local timezone -- calendar.timegm()
+        # does that; time.mktime() would incorrectly apply the local zone.
         y, mo, d, h, mi, s, _wd = self.datetime_tuple()
-        return utime.mktime((y, mo, d, h, mi, s, 0, 0))
+        return calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
 
     def iso_string(self):
         y, mo, d, h, mi, s, _wd = self.datetime_tuple()
-        # Formats once and just returns it -- previously formatted the same
-        # string twice (once to print as an unwanted side effect of a
-        # getter, once to return), so every call to a "read the date"
-        # function did a needless duplicate allocation, and every caller
-        # that also prints the result (main.py does) got it printed twice.
         return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(y, mo, d, h, mi, s)

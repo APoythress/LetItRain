@@ -2,8 +2,6 @@
 # Controller state — tracks what is running right now.
 # Extended for multi-zone: tracks which zone is active.
 
-import utime
-
 
 class ControllerState:
     """

@@ -13,21 +13,18 @@
 # Verified directly against Adafruit's own reference implementation
 # (adafruit_character_lcd/character_lcd_spi.py's ShiftRegister74HC595
 # pin assignment: get_pin(0..6) => RS, Enable, D7, D6, D5, D4,
-# backlight) -- an earlier version of this file had every one of these
-# shifted one bit too high (a genuine reverse-engineering mistake, not
-# a hardware/wiring issue), which meant the "backlight" bit didn't
-# actually reach the backlight circuit at all, and RS/Enable/D4-D7 were
-# each landing one signal off from what the HD44780 expected -- enough
-# to leave the display showing uninitialized blank character cells
-# (whose visibility the contrast pot still affects, since that's a
-# separate analog circuit) but never a working init sequence.
+# backlight).
 #
 # Every register update is: LAT low, shift the byte out MSB-first while
 # pulsing CLK once per bit, then LAT high (rising edge copies the shift
 # register into the output latches, which is what the LCD actually sees).
+#
+# Ported from machine.Pin/utime to gpiozero.OutputDevice/time -- the
+# bit-banging logic itself (shift/latch/nibble sequencing, timing) is
+# unchanged.
 
-from machine import Pin
-import utime
+from gpiozero import OutputDevice
+import time
 
 _CLEAR_DISPLAY   = 0x01
 _ENTRY_MODE_SET  = 0x04
@@ -46,9 +43,9 @@ _ROW_OFFSETS = (0x00, 0x40)  # 16x2 only
 
 class LCD1602:
     def __init__(self, dat_pin, clk_pin, lat_pin):
-        self._dat = Pin(dat_pin, Pin.OUT)
-        self._clk = Pin(clk_pin, Pin.OUT)
-        self._lat = Pin(lat_pin, Pin.OUT)
+        self._dat = OutputDevice(dat_pin)
+        self._clk = OutputDevice(clk_pin)
+        self._lat = OutputDevice(lat_pin)
         self._backlight = 0x40  # bit6, on by default -- see module header for bit mapping
         self._init_display()
 
@@ -58,14 +55,14 @@ class LCD1602:
 
     def _shift_out(self, byte):
         for i in range(7, -1, -1):
-            self._dat.value((byte >> i) & 1)
-            self._clk.value(1)
-            self._clk.value(0)
+            self._dat.value = (byte >> i) & 1
+            self._clk.on()
+            self._clk.off()
 
     def _latch(self, byte):
-        self._lat.value(0)
+        self._lat.off()
         self._shift_out(byte)
-        self._lat.value(1)
+        self._lat.on()
 
     def _write_nibble(self, rs, nibble):
         # nibble bit0->D4, bit1->D5, bit2->D6, bit3->D7 per the standard
@@ -81,14 +78,14 @@ class LCD1602:
         )
         self._latch(base)          # EN=0, data+RS settled
         self._latch(base | 0x02)   # EN=1 -- HD44780 samples while high
-        utime.sleep_us(2)
+        time.sleep(2e-6)
         self._latch(base)          # EN=0 -- falling edge latches the nibble
-        utime.sleep_us(2)
+        time.sleep(2e-6)
 
     def _write_byte(self, rs, value, exec_delay_us=50):
         self._write_nibble(rs, (value >> 4) & 0x0F)
         self._write_nibble(rs, value & 0x0F)
-        utime.sleep_us(exec_delay_us)
+        time.sleep(exec_delay_us * 1e-6)
 
     def _command(self, cmd, exec_delay_us=50):
         self._write_byte(0, cmd, exec_delay_us)
@@ -101,17 +98,17 @@ class LCD1602:
     # ------------------------------------------------------------------
 
     def _init_display(self):
-        utime.sleep_ms(50)  # HD44780 power-on settle time
+        time.sleep(0.05)  # HD44780 power-on settle time
         # Force into a known state regardless of whatever mode the
         # controller powered up in -- this backpack has no reset pin, so
         # this datasheet-mandated nibble sequence is the only way to
         # guarantee it's actually in 4-bit mode afterward.
         self._write_nibble(0, 0x03)
-        utime.sleep_us(4500)
+        time.sleep(4500e-6)
         self._write_nibble(0, 0x03)
-        utime.sleep_us(4500)
+        time.sleep(4500e-6)
         self._write_nibble(0, 0x03)
-        utime.sleep_us(150)
+        time.sleep(150e-6)
         self._write_nibble(0, 0x02)  # now actually in 4-bit mode
 
         self._command(_FUNCTION_SET | _4BIT_MODE | _2LINE | _5x8_DOTS)
