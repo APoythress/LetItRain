@@ -45,7 +45,7 @@ async def _body_or_none(request: Request):
 
 
 def create_app(config, state, rtc, on_manual_start, on_manual_stop,
-                on_zones_changed, local_override, local_resync_trigger,
+                on_config_saved, local_override, local_resync_trigger,
                 save_config_fn, now_fn, firmware_version):
     """
     Build the FastAPI app. All the shared, already-initialized objects
@@ -108,8 +108,7 @@ def create_app(config, state, rtc, on_manual_start, on_manual_stop,
             for k, v in body.items():
                 config[k] = v
             save_config_fn(config)
-            if "zones" in body:
-                on_zones_changed(config.get("zones", []))
+            await on_config_saved(set(body.keys()))
             return {"saved": True}
         return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
 

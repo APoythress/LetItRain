@@ -519,17 +519,33 @@ async def main():
     async def relay_stop_fn(status_str):
         await stop_run(relay, state, config, status_writer, status_str)
 
-    def on_zones_changed(zones_config):
-        """Rebuild the relay's live pin map after a /config POST changes
-        which zones are enabled or which pins they use -- otherwise the
-        change only lands in config.json and never takes effect until
-        the process restarts."""
-        relay.reconfigure(zones_config)
+    async def on_config_saved(changed_keys):
+        """Fires after every successful /config save. Rebuilds the relay's
+        live pin map immediately when zones change (otherwise the change
+        only lands in config.json and never takes effect until the process
+        restarts -- see hardware/relay.py's reconfigure()), and pushes
+        zones/schedule to Firebase immediately rather than waiting for
+        meta_sync_loop's next 300s cycle -- otherwise a save followed by
+        closing the app (or the process restarting) before that cycle
+        fires means Firebase, and therefore the app's remote/cold-launch
+        view, silently shows a stale pre-edit copy with no indication
+        anything is out of date."""
+        if "zones" in changed_keys:
+            relay.reconfigure(config.get("zones", []))
+            try:
+                await schedule_sync.push_zones()
+            except Exception as ex:
+                print("Immediate zones push after /config save failed (non-fatal):", ex)
+        if "schedule" in changed_keys:
+            try:
+                await schedule_sync.push_schedule()
+            except Exception as ex:
+                print("Immediate schedule push after /config save failed (non-fatal):", ex)
 
     app = create_app(
         config=config, state=state, rtc=rtc,
         on_manual_start=on_manual_start, on_manual_stop=on_manual_stop,
-        on_zones_changed=on_zones_changed,
+        on_config_saved=on_config_saved,
         local_override=local_override, local_resync_trigger=local_resync_trigger,
         save_config_fn=save_config, now_fn=unix_time,
         firmware_version=FIRMWARE_VERSION,
