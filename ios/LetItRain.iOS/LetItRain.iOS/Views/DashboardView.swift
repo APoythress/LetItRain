@@ -404,22 +404,42 @@ struct DashboardView: View {
 
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Software Update").font(.subheadline).foregroundColor(.white.opacity(0.5))
-                if let message = deviceVM.otaStatus.message, deviceVM.otaStatus.status != "idle" {
+                HStack(spacing: 6) {
+                    Text("Software Update").font(.subheadline).foregroundColor(.white.opacity(0.5))
+                    if deviceVM.otaStatus.isUpdateAvailable {
+                        Circle().fill(Color(hex: "FFA726")).frame(width: 6, height: 6)
+                    }
+                }
+                if deviceVM.otaStatus.isUpdateAvailable, let version = deviceVM.otaStatus.availableVersion {
+                    Text("Version \(version) available").font(.caption2).foregroundColor(Color(hex: "FFA726"))
+                } else if let message = deviceVM.otaStatus.message, deviceVM.otaStatus.status != "idle" {
                     Text(message).font(.caption2).foregroundColor(.white.opacity(0.4))
                 }
             }
             Spacer()
-            Button {
-                deviceVM.checkForUpdate()
-            } label: {
-                if deviceVM.otaStatus.isInProgress {
-                    ProgressView().tint(.white.opacity(0.6))
-                } else {
-                    Text("Check Now").font(.caption.weight(.semibold))
+            if deviceVM.otaStatus.isUpdateAvailable {
+                Button {
+                    deviceVM.applyUpdate()
+                } label: {
+                    if deviceVM.otaStatus.isInProgress {
+                        ProgressView().tint(.white.opacity(0.6))
+                    } else {
+                        Text("Update Now").font(.caption.weight(.semibold)).foregroundColor(Color(hex: "FFA726"))
+                    }
                 }
+                .disabled(deviceVM.otaStatus.isInProgress)
+            } else {
+                Button {
+                    deviceVM.checkForUpdate()
+                } label: {
+                    if deviceVM.otaStatus.isInProgress {
+                        ProgressView().tint(.white.opacity(0.6))
+                    } else {
+                        Text("Check Now").font(.caption.weight(.semibold))
+                    }
+                }
+                .disabled(deviceVM.otaStatus.isInProgress || !deviceVM.status.isRecentlyOnline)
             }
-            .disabled(deviceVM.otaStatus.isInProgress || !deviceVM.status.isRecentlyOnline)
         }
     }
 

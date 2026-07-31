@@ -254,16 +254,26 @@ final class DeviceViewModel: ObservableObject {
         }
     }
 
+    /// Update checks/applies always go through Firebase, in either local or
+    /// remote mode -- the Pi polls its Firebase update node rather than
+    /// exposing a local HTTP trigger for this (see main.py's update_loop).
     func checkForUpdate() {
         Task {
             isLoading = true
             do {
-                if let client = localClient {
-                    try await client.sendCheckUpdate()
-                } else {
-                    try await firebaseRepository.requestUpdateCheck()
-                }
+                try await firebaseRepository.requestUpdateCheck()
                 successMessage = "Checking for update..."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    func applyUpdate() {
+        Task {
+            isLoading = true
+            do {
+                try await firebaseRepository.applyUpdate()
+                successMessage = "Update requested -- applying shortly."
             } catch { handleError(error) }
             isLoading = false
         }

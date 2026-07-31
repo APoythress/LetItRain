@@ -7,6 +7,12 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=main
 WorkingDirectory=/opt/letitrain/RPI
+# Without this, journald captures a non-TTY stdout, so Python block-buffers
+# print() output (everything in main.py's boot sequence and hardware
+# modules) while uvicorn's own logging still flushes immediately -- the
+# journal ends up showing only the uvicorn INFO lines with the actual
+# diagnostic prints stuck in a buffer that may not flush for a long time.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/letitrain/RPI/venv/bin/python /opt/letitrain/RPI/main.py
 Restart=always
 RestartSec=5

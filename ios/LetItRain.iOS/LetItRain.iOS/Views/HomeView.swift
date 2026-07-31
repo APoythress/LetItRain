@@ -24,6 +24,7 @@ struct HomeView: View {
                     .tabItem {
                         Label("Dashboard", systemImage: "drop.fill")
                     }
+                    .badge(deviceVM.otaStatus.isUpdateAvailable ? "1" : nil)
                     .tag(0)
 
                 scheduleTab

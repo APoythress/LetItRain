@@ -20,14 +20,18 @@
 #   - Process supervision/watchdog is systemd's (see deploy/letitrain.service)
 #     -- this sends sd_notify(WATCHDOG=1) on its own heartbeat instead of
 #     the Pico build's manual machine.WDT.feed() calls.
-#   - OTA updates are out of scope for this alpha (see update/updater.py
-#     and the plan doc) -- no /check-update endpoint, no update checks.
+#   - OTA updates are git-tag-based (see firebase/update_checker.py) --
+#     replaces update/updater.py, which was MicroPython/Pico-only and
+#     never applicable here. No push notifications yet: the app surfaces
+#     an "update available" badge from the same Firebase status this
+#     writes, and the user drives it from there.
 
 import asyncio
 import json
 import os
 import socket
 import subprocess
+import sys
 import time
 
 import uvicorn
@@ -51,6 +55,7 @@ from firebase.client         import FirebaseClient
 from firebase.status_writer  import StatusWriter
 from firebase.override_reader import OverrideReader
 from firebase.schedule_sync  import ScheduleSync
+from firebase                import update_checker
 from web.server             import create_app
 
 FIRMWARE_VERSION = "2.0.0-alpha"
@@ -65,6 +70,10 @@ META_SYNC_INTERVAL   = 300    # seconds -- Firebase zones/schedule/IP push
 RTC_MIRROR_INTERVAL  = 3600   # seconds -- mirror system clock into DS3231
 WATCHDOG_INTERVAL    = 10     # seconds -- must be well under the systemd
                                # unit's WatchdogSec/2 (see deploy/letitrain.service)
+UPDATE_POLL_INTERVAL  = 300    # seconds -- how often we check Firebase for an
+                                # "Update Now" tap or a manual "Check Now" request
+UPDATE_CHECK_INTERVAL = 21600  # seconds (6h) -- how often we check for a new
+                                # version at all, absent a manual request
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +113,7 @@ async def watchdog_loop():
 # Networking helpers -- WiFi association itself is OS-managed (see module
 # header); these are just cheap checks/lookups the app still needs.
 # ---------------------------------------------------------------------------
-
+#region
 def local_ip():
     """Best-effort local IP via the outbound-UDP-socket trick (no packets
     actually sent -- connect() on a UDP socket just picks the interface/
@@ -126,12 +135,12 @@ async def network_reachable(host="8.8.8.8", port=443, timeout=3):
         return True
     except Exception:
         return False
-
+#endregion
 
 # ---------------------------------------------------------------------------
 # DS3231 <-> system clock
 # ---------------------------------------------------------------------------
-
+#region
 def seed_system_clock_from_rtc(rtc):
     """Best-effort boot-time seed: if the system clock looks unset (before
     2020 -- a fresh Pi with no RTC battery backup and no network yet boots
@@ -165,6 +174,7 @@ def mirror_system_clock_to_rtc(rtc):
         print("RTC: mirrored system clock ->", rtc.iso_string())
     except Exception as ex:
         print("RTC mirror failed (non-fatal):", ex)
+#endregion
 
 
 def _write_boot_log(log):
@@ -192,7 +202,7 @@ def _format_ip_version(ip, version):
 # ---------------------------------------------------------------------------
 # Run control
 # ---------------------------------------------------------------------------
-
+#region
 def _stop_relay_for_current_zone(relay, state):
     if state.current_zone_id:
         relay.off(state.current_zone_id)
@@ -242,12 +252,12 @@ async def stop_run(relay, state, config, status_writer, status_str="completed"):
             await status_writer.push_last_run(start_epoch, end_epoch, mode, zone_id, status_str)
         except Exception as ex:
             print("Firebase push_last_run failed (non-fatal):", ex)
-
+#endregion
 
 # ---------------------------------------------------------------------------
 # Background tasks
 # ---------------------------------------------------------------------------
-
+#region
 async def local_control_loop(relay, state, config, tz_name, last_run_slots,
                               lcd_status, local_ip_holder, local_override,
                               override_reader, status_writer, relay_stop_fn):
@@ -300,7 +310,7 @@ async def local_control_loop(relay, state, config, tz_name, last_run_slots,
                     next_day, next_hour, next_minute, _next_zone = next_slot
                     day_abbr = next_day[:3]
                     day_abbr = day_abbr[0].upper() + day_abbr[1:]
-                    next_text = "{} {:02d}:{:02d}".format(day_abbr, next_hour, next_minute)
+                    next_text = "Next: {} {:02d}:{:02d}".format(day_abbr, next_hour, next_minute)
                 else:
                     next_text = "No sched"
                 ip_text, version_text = _format_ip_version(local_ip_holder["ip"], FIRMWARE_VERSION)
@@ -383,10 +393,91 @@ async def resync_trigger_loop(rtc, local_resync_trigger):
             print("RTC: resynced (manual trigger)")
 
 
+async def update_loop(fb, state):
+    """
+    Polls Firebase's update node every UPDATE_POLL_INTERVAL for either an
+    "Update Now" tap (apply_requested) or a "Check Now" tap (requested),
+    and otherwise runs a real version check on its own UPDATE_CHECK_INTERVAL
+    cadence. No push notifications yet -- the app reads this same node to
+    show an "update available" badge and drives everything from there.
+
+    An apply is deferred (not lost) if a zone is currently running --
+    re-checked next poll instead of interrupting an active irrigation run.
+    Applying a version successfully ends the process (sys.exit) so
+    systemd's Restart=always relaunches it running the newly checked-out
+    code; a failed checkout just reports the error and stays on the
+    current version.
+    """
+    last_version_check = 0
+    while True:
+        await asyncio.sleep(UPDATE_POLL_INTERVAL)
+        try:
+            update_node = await fb.get("update") or {}
+        except Exception as ex:
+            print("Update: Firebase read failed (non-fatal):", ex)
+            continue
+
+        now = unix_time()
+
+        if update_node.get("apply_requested"):
+            available_version = update_node.get("available_version")
+            if not available_version:
+                print("Update: apply_requested with no available_version on file -- clearing")
+                await fb.patch("update", {"apply_requested": False})
+                continue
+            if state.is_running():
+                print("Update: apply requested but a zone is currently running -- deferring")
+                continue
+            print("Update: applying", available_version)
+            await fb.patch("update", {"status": "applying",
+                                        "message": "Applying update..."})
+            ok, err = update_checker.apply_update(available_version)
+            if ok:
+                print("Update: checked out", available_version, "-- restarting")
+                await fb.patch("update", {
+                    "status": "idle", "apply_requested": False,
+                    "current_version": available_version, "available_version": None,
+                    "message": "Updated to {}".format(available_version),
+                })
+                sys.exit(0)
+            print("Update: checkout failed:", err)
+            await fb.patch("update", {"status": "error", "apply_requested": False,
+                                        "message": "Update failed: {}".format(err)})
+            continue
+
+        due_for_check = (now - last_version_check) >= UPDATE_CHECK_INTERVAL
+        if not (due_for_check or update_node.get("requested")):
+            continue
+
+        last_version_check = now
+        print("Update: checking for new version...")
+        await fb.patch("update", {"status": "checking", "requested": False})
+        try:
+            latest_tag = update_checker.get_latest_tag()
+        except Exception as ex:
+            print("Update: version check failed (non-fatal):", ex)
+            await fb.patch("update", {"status": "error", "message": str(ex)})
+            continue
+
+        if latest_tag and update_checker.is_newer(latest_tag, FIRMWARE_VERSION):
+            print("Update: available ->", latest_tag)
+            await fb.patch("update", {
+                "status": "available", "available_version": latest_tag,
+                "current_version": FIRMWARE_VERSION, "checked_at": now,
+                "message": "Version {} available".format(latest_tag),
+            })
+        else:
+            await fb.patch("update", {
+                "status": "idle", "available_version": None,
+                "current_version": FIRMWARE_VERSION, "checked_at": now,
+                "message": "Up to date at {}".format(FIRMWARE_VERSION),
+            })
+
+
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
-
+#region
 async def main():
     config  = load_config()
     state   = ControllerState()
@@ -398,30 +489,37 @@ async def main():
     )
     relay.all_off()   # SAFETY: de-energise all relays before anything else
 
-    status_led = StatusLED(green_pin=16, red_pin=17)
+    status_led = StatusLED(green_pin=23, red_pin=24)   # physical 16, 18
     status_led.set_mode("booting")
 
+    # =======================================================================
+    # ========== LCD
+    # =======================================================================
+
     # LCD is non-fatal -- an unwired/broken backpack shouldn't take the
-    # whole controller down, it just means no display.
-    #
-    # NOTE: dat_pin and lat_pin are both 11 here, matching the current
-    # main.py on the Pico branches -- that looks like a pre-existing wiring
-    # bug (the fatal-error fallback path in the Pico build correctly uses
-    # three distinct pins, 18/19/20) carried forward as-is rather than
-    # silently guessed at. Double-check this against the real wiring once
-    # the Pi arrives -- pin 11 is also Zone 5's relay pin in config.json.
+    # whole controller down, it just means no display. Talks to the
+    # backpack's MCP23008 over I2C bus 3 -- a software (bit-banged) I2C
+    # bus on GPIO27/GPIO17 (dtoverlay=i2c-gpio in /boot/firmware/config.txt),
+    # matching this board's existing DAT/CLK terminal-block wiring rather
+    # than the Pi's dedicated hardware I2C1 bus (which the DS3231 below
+    # uses instead, on GPIO2/GPIO3).
+    from smbus2 import SMBus
+
     lcd_status = None
     try:
-        lcd = LCD1602(dat_pin=11, clk_pin=10, lat_pin=11)
+        lcd_bus = SMBus(3)
+        lcd = LCD1602(lcd_bus)
         lcd_status = LCDStatus(lcd)
         lcd_status.show_message("Booting")
         print("LCD: initialized OK")
     except Exception as ex:
         print("LCD init failed (not wired?):", ex)
 
+    # =======================================================================
+    # ========== RTC
+    # =======================================================================
     rtc = None
     try:
-        from smbus2 import SMBus
         bus = SMBus(1)   # /dev/i2c-1, the Pi's user-facing I2C bus (GPIO2/GPIO3)
         rtc = DS3231(bus)
         rtc.datetime_tuple()   # probe
@@ -432,6 +530,9 @@ async def main():
 
     seed_system_clock_from_rtc(rtc)
 
+    # =======================================================================
+    # ========== Network
+    # =======================================================================
     last_run_slots  = {}
     local_ip_holder = {"ip": local_ip()}
 
@@ -445,6 +546,9 @@ async def main():
 
     boot_log["network_reachable"] = await network_reachable()
 
+    # =======================================================================
+    # ========== Firebase
+    # =======================================================================
     fb = FirebaseClient(
         api_key=FIREBASE_API_KEY, email=FIREBASE_EMAIL,
         password=FIREBASE_PASSWORD, db_url=FIREBASE_DB_URL,
@@ -505,7 +609,10 @@ async def main():
     _write_boot_log(boot_log)
     print("LetItRain v{} booting... boot_log={}".format(FIRMWARE_VERSION, boot_log))
 
-    # --- HTTP API + callbacks ---
+    # =======================================================================
+    # ========== HTTP API + callbacks
+    # =======================================================================
+
     local_override       = {"skip_today": False, "skip_reason": None}
     local_resync_trigger = {"requested": False}
 
@@ -553,6 +660,9 @@ async def main():
     uv_config = uvicorn.Config(app, host="0.0.0.0", port=80, log_level="info")
     server = uvicorn.Server(uv_config)
 
+    # =======================================================================
+    # ========== Main tasks
+    # =======================================================================
     print("Main tasks starting.")
     try:
         await asyncio.gather(
@@ -564,6 +674,7 @@ async def main():
             meta_sync_loop(status_writer, schedule_sync, local_ip_holder),
             rtc_mirror_loop(rtc),
             resync_trigger_loop(rtc, local_resync_trigger),
+            update_loop(fb, state),
             watchdog_loop(),
         )
     finally:
@@ -574,7 +685,7 @@ async def main():
         except Exception:
             pass
         await fb.aclose()
-
+#endregion
 
 if __name__ == "__main__":
     asyncio.run(main())

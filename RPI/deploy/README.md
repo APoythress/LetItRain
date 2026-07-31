@@ -11,6 +11,16 @@ dtparam=i2c_arm=on
 dtparam=watchdog=on
 ```
 
+The LCD backpack's MCP23008 talks I2C over the same DAT/CLK terminal-block
+pins its SPI mode would otherwise use, via a second, software (bit-banged)
+I2C bus rather than the Pi's dedicated hardware I2C1 (which the DS3231 RTC
+uses instead, on GPIO2/GPIO3). Add this too, adjusting the GPIO numbers if
+your DAT/CLK wiring differs from `main.py`'s (currently GPIO27/GPIO17):
+
+```
+dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=27,i2c_gpio_scl=17
+```
+
 Enable systemd's use of the hardware watchdog by adding to
 `/etc/systemd/system.conf`:
 
@@ -21,7 +31,8 @@ RuntimeWatchdogSec=30
 Reboot for both to take effect. Confirm with:
 
 ```
-ls /dev/i2c-1 /dev/watchdog
+ls /dev/i2c-1 /dev/i2c-3 /dev/watchdog
+i2cdetect -y 3   # should show 0x20 -- the LCD backpack's MCP23008
 ```
 
 ## 2. Install the app

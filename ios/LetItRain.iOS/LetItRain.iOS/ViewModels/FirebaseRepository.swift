@@ -225,6 +225,16 @@ final class FirebaseRepository: ObservableObject {
         try await db.child("\(devicePath)/update").updateChildValues(["requested": true])
     }
 
+    /// Confirm the already-detected update should be applied now. Safe to
+    /// call in either local or remote mode -- unlike zones/schedule, the
+    /// security rules allow the assigned app user to write this node, and
+    /// the Pi defers applying if a zone happens to be running when it sees
+    /// the flag rather than needing this to be a same-LAN action.
+    func applyUpdate() async throws {
+        guard let devicePath else { throw FirebaseRepositoryError.deviceNotConfigured }
+        try await db.child("\(devicePath)/update").updateChildValues(["apply_requested": true])
+    }
+
     func currentMeta() async -> DeviceMeta? { meta }
 
     // MARK: - Helpers
