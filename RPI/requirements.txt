@@ -1,0 +1,19 @@
+# LetItRain v2.0.0-alpha — Raspberry Pi 3 A+ (CPython 3 / Linux)
+#
+# Core async stack
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+
+# Hardware
+gpiozero>=2.0
+smbus2>=0.4
+
+# zoneinfo (stdlib since Python 3.9) needs the IANA tz database available --
+# tzdata bundles it so this doesn't depend on the host OS having it installed.
+tzdata>=2024.1
+
+# gpiozero's real (non-mock) Pi pin factory. Only installable on Linux ARM --
+# marked so `pip install -r requirements.txt` still succeeds on a dev machine
+# using GPIOZERO_PIN_FACTORY=mock. Not needed until the physical board arrives.
+RPi.GPIO>=0.7.1 ; platform_machine == "armv7l" or platform_machine == "aarch64"

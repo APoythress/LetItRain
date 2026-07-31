@@ -1,0 +1,35 @@
+[Unit]
+Description=LetItRain irrigation controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/opt/letitrain/RPI
+# Without this, journald captures a non-TTY stdout, so Python block-buffers
+# print() output (everything in main.py's boot sequence and hardware
+# modules) while uvicorn's own logging still flushes immediately -- the
+# journal ends up showing only the uvicorn INFO lines with the actual
+# diagnostic prints stuck in a buffer that may not flush for a long time.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/letitrain/RPI/venv/bin/python /opt/letitrain/RPI/main.py
+Restart=always
+RestartSec=5
+
+# Must be comfortably above main.py's WATCHDOG_INTERVAL (10s) -- systemd
+# hard-restarts the unit if it goes this long without a WATCHDOG=1
+# notification (see main.py's watchdog_loop()). Requires the kernel's
+# bcm2835_wdt watchdog driver AND systemd's own RuntimeWatchdogSec to both
+# be enabled -- see deploy/README.md.
+WatchdogSec=30
+
+# Binds port 80 (privileged), needs GPIO/I2C access, and runs
+# `date -u -s` to seed the system clock from the DS3231 at boot -- root
+# is the simplest correct choice for a single-purpose embedded controller.
+# See deploy/README.md if you'd rather scope this down to a dedicated
+# user with just the gpio/i2c groups + CAP_NET_BIND_SERVICE.
+User=root
+
+[Install]
+WantedBy=multi-user.target

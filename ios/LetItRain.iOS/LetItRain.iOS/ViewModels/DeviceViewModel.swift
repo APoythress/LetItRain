@@ -4,6 +4,12 @@
 import Foundation
 import Combine
 
+/// Thrown by any action that requires local Wi-Fi (schedule save, manual
+/// start/stop) when attempted without a local connection.
+private struct LocalOnlyError: LocalizedError {
+    var errorDescription: String? { "Requires local Wi-Fi connection." }
+}
+
 @MainActor
 final class DeviceViewModel: ObservableObject {
 
@@ -20,7 +26,6 @@ final class DeviceViewModel: ObservableObject {
     private let firebaseRepository: FirebaseRepository
     private var localClient:        LocalAPIClient?
     private var cancellables        = Set<AnyCancellable>()
-    private var localRefreshTimer:  Timer?
 
     init(connectionManager: ConnectionManager, firebaseRepository: FirebaseRepository) {
         self.connectionManager  = connectionManager
@@ -36,10 +41,11 @@ final class DeviceViewModel: ObservableObject {
     // MARK: - Observation
 
     private func observeMetaAvailability() {
-        // The connection manager's periodic timer alone can leave the app
-        // showing "Remote" for up to 30s after launch, since on a cold start
-        // the Pico's local IP usually hasn't arrived from Firebase yet when
-        // the first evaluation runs. Re-evaluate the moment it does.
+        // On a cold start, the app-launch evaluation usually runs before the
+        // Pico's local IP has arrived from Firebase, so that first pass has
+        // nothing to probe and falls back to "Remote". Since there's no
+        // background timer to catch up later (see ConnectionManager), this
+        // is what re-triggers evaluation the moment the IP does arrive.
         firebaseRepository.$meta
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.connectionManager.evaluate(reason: "meta updated") }
@@ -57,10 +63,9 @@ final class DeviceViewModel: ObservableObject {
         switch mode {
         case .local(let baseURL):
             localClient = LocalAPIClient(baseURL: baseURL)
-            startLocalPolling()
+            Task { await refreshLocal() }
         case .remote, .offline:
             localClient = nil
-            stopLocalPolling()
             config = firebaseRepository.config
         }
     }
@@ -97,58 +102,48 @@ final class DeviceViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    // Schedule editing is local-only -- there is no remote-write fallback
+    // here on purpose (see root README's Firebase rules note: zones/schedule
+    // .write is owner-uid/Pico-only now, so a remote write would be
+    // rejected by the rules even if attempted). ScheduleView is only ever
+    // shown while connectionManager.mode.isLocal (see HomeView), so the
+    // no-client branch below should never actually fire in practice; it's
+    // a clear error rather than a silent no-op if it somehow does.
     private func wireScheduleVM() {
         scheduleVM.onSave = { [weak self] updatedConfig in
-            guard let self else { return }
-            if let client = self.localClient {
-                try await client.updateConfig(updatedConfig)
-                self.config = updatedConfig
-            } else {
-                try await self.firebaseRepository.writeConfig(updatedConfig)
+            guard let self, let client = self.localClient else {
+                throw LocalOnlyError()
             }
+            try await client.updateConfig(updatedConfig)
+            self.config = updatedConfig
         }
     }
 
-    // MARK: - Local polling
-
-    // The Pico's HTTP server handles exactly one connection at a time --
-    // there's no real concurrency on that side, and every request is a
-    // resource competing with its Firebase/TLS traffic for very limited RAM.
-    // The app tolerates 30-45s of staleness on everything, so this polls
-    // status every 30s and config every other tick (60s -- it rarely
-    // changes anyway), one request at a time rather than concurrently.
-    private var localPollCount = 0
-
-    private func startLocalPolling() {
-        stopLocalPolling()
-        localPollCount = 0
-        localRefreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in await self?.refreshLocal() }
-        }
-        Task { await refreshLocal() }
-    }
-
-    private func stopLocalPolling() {
-        localRefreshTimer?.invalidate()
-        localRefreshTimer = nil
-    }
+    // MARK: - Local refresh
+    //
+    // No background polling loop -- the Pico's HTTP server handles exactly
+    // one connection at a time, and a separate always-on timer here used to
+    // race ConnectionManager's own connectivity probe for that one slot,
+    // which is what caused the alternating 200/timeout pattern (see
+    // ConnectionManager's comment on why it dropped its periodic timer too).
+    // Instead: fetch once whenever we transition into local mode (above),
+    // once whenever a screen appears (HomeView.onAppear -> refresh()), and
+    // once after every action that changes state (start/stop/skip below,
+    // all already refresh on completion). A running zone's countdown needs
+    // no polling at all -- DashboardView computes it client-side every
+    // second from the fetched run_ends_at timestamp.
 
     private func refreshLocal() async {
         guard let client = localClient else { return }
         do {
-            let newStatus = try await client.fetchStatus()
-            status = newStatus
-
-            localPollCount += 1
-            guard localPollCount % 2 == 0 || config == nil else { return }
-
+            status = try await client.fetchStatus()
             let newConfig = try await client.fetchConfig()
             config = newConfig
             if !scheduleVM.hasUnsavedChanges {
                 scheduleVM.load(from: newConfig)
             }
         } catch {
-            connectionManager.evaluate(reason: "local poll failed")
+            connectionManager.evaluate(reason: "local refresh failed")
         }
     }
 
@@ -189,17 +184,35 @@ final class DeviceViewModel: ObservableObject {
         }
     }
 
+    /// Local-only instant skip. Remote uses `skipForDays(_:)` instead, since
+    /// "skip today" alone isn't useful when you won't be back to check the
+    /// app again before tomorrow's run.
     func skipToday() {
+        guard let client = localClient else {
+            errorMessage = "Requires local Wi-Fi connection."
+            return
+        }
         Task {
             isLoading = true
             do {
-                if let client = localClient {
-                    try await client.sendSkipToday()
-                    await refreshLocal()
-                } else {
-                    try await firebaseRepository.writeSkipToday()
-                }
+                try await client.sendSkipToday()
+                await refreshLocal()
                 successMessage = "Today's scheduled run will be skipped."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    /// Remote-only: skip the schedule for the next `days` days (inclusive of
+    /// today) -- the out-of-town use case.
+    func skipForDays(_ days: Int) {
+        Task {
+            isLoading = true
+            do {
+                try await firebaseRepository.writeSkip(days: days)
+                successMessage = days <= 1
+                    ? "Today's scheduled run will be skipped."
+                    : "Schedule skipped for \(days) days."
             } catch { handleError(error) }
             isLoading = false
         }
@@ -221,12 +234,46 @@ final class DeviceViewModel: ObservableObject {
         }
     }
 
+    /// Local-only: manually re-sync the Pico's clock from NTP right now.
+    /// This also happens automatically once a day at 3am -- this is just
+    /// for "I don't want to wait until tonight." Not offered remotely: the
+    /// daily job already covers the drift-correction need without a
+    /// Firebase round-trip.
+    func resyncTime() {
+        guard let client = localClient else {
+            errorMessage = "Requires local Wi-Fi connection."
+            return
+        }
+        Task {
+            isLoading = true
+            do {
+                try await client.sendResyncTime()
+                successMessage = "Clock resynced."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    /// Update checks/applies always go through Firebase, in either local or
+    /// remote mode -- the Pi polls its Firebase update node rather than
+    /// exposing a local HTTP trigger for this (see main.py's update_loop).
     func checkForUpdate() {
         Task {
             isLoading = true
             do {
                 try await firebaseRepository.requestUpdateCheck()
                 successMessage = "Checking for update..."
+            } catch { handleError(error) }
+            isLoading = false
+        }
+    }
+
+    func applyUpdate() {
+        Task {
+            isLoading = true
+            do {
+                try await firebaseRepository.applyUpdate()
+                successMessage = "Update requested -- applying shortly."
             } catch { handleError(error) }
             isLoading = false
         }

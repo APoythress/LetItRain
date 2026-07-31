@@ -128,6 +128,10 @@ dmypy.json
 # v1.1.0 additions
 secrets.py
 cloud_functions/node_modules/
+
+# v2.0.0-alpha (Pi 3 A+): renamed from secrets.py, which shadows Python's
+# stdlib `secrets` module (Starlette/FastAPI import secrets.token_hex)
+device_secrets.py
 ios/*.xcodeproj/xcuserdata/
 ios/*.xcworkspace/xcuserdata/
 *.DS_Store

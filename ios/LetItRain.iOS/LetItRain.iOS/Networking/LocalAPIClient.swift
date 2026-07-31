@@ -71,6 +71,7 @@ final class LocalAPIClient {
 
     func sendSkipToday() async throws  { try await post("/skip-today",   body: nil) }
     func cancelSkip()   async throws   { try await post("/cancel-skip",  body: nil) }
+    func sendResyncTime()  async throws { try await post("/resync-time",  body: nil) }
 
     // MARK: - Internals
 

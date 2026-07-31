@@ -24,6 +24,7 @@ struct HomeView: View {
                     .tabItem {
                         Label("Dashboard", systemImage: "drop.fill")
                     }
+                    .badge(deviceVM.otaStatus.isUpdateAvailable ? "1" : nil)
                     .tag(0)
 
                 scheduleTab
@@ -49,14 +50,20 @@ struct HomeView: View {
             Spacer()
             Button { showDiagnostics = true } label: {
                 HStack(spacing: 6) {
-                    Circle()
-                        .fill(modeColor)
-                        .frame(width: 7, height: 7)
-                        .opacity(connectionManager.mode == .offline ? 0.5 : 1)
+                    if connectionManager.isEvaluating {
+                        ProgressView().scaleEffect(0.6).frame(width: 7, height: 7)
+                    } else {
+                        Circle()
+                            .fill(modeColor)
+                            .frame(width: 7, height: 7)
+                            .opacity(connectionManager.mode == .offline ? 0.5 : 1)
+                    }
 
-                    Text(connectionManager.mode.displayName)
+                    Text(connectionManager.isEvaluating
+                         ? "Trying to connect to sprinkler…"
+                         : connectionManager.mode.displayName)
                         .font(.caption2.weight(.semibold))
-                        .foregroundColor(modeColor)
+                        .foregroundColor(connectionManager.isEvaluating ? .white.opacity(0.6) : modeColor)
 
                     Image(systemName: "info.circle")
                         .font(.caption2)
@@ -90,24 +97,19 @@ struct HomeView: View {
         }
     }
 
-    // MARK: - Schedule tab (disabled only when the device itself is offline)
+    // MARK: - Schedule tab (local only -- see DeviceViewModel.wireScheduleVM)
 
     @ViewBuilder
     private var scheduleTab: some View {
         if connectionManager.mode.isLocal {
             ScheduleView()
-        } else if deviceVM.status.isRecentlyOnline {
-            VStack(spacing: 0) {
-                remoteSyncBanner
-                ScheduleView()
-            }
         } else {
             VStack(spacing: 16) {
                 Spacer()
                 Image(systemName: "wifi.slash")
                     .font(.system(size: 44))
                     .foregroundColor(.white.opacity(0.3))
-                Text("Schedule editing requires\nthe device to be online.")
+                Text("Schedule editing requires\nbeing on your home Wi-Fi.")
                     .font(.subheadline)
                     .foregroundColor(.white.opacity(0.5))
                     .multilineTextAlignment(.center)
@@ -116,18 +118,5 @@ struct HomeView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(hex: "0A1628"))
         }
-    }
-
-    private var remoteSyncBanner: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "icloud.and.arrow.up")
-            Text("Editing remotely — changes may take up to a minute to reach the device.")
-                .font(.caption2)
-        }
-        .foregroundColor(Color(hex: "FFA726"))
-        .padding(.horizontal, 12).padding(.vertical, 6)
-        .background(Color(hex: "FFA726").opacity(0.15))
-        .clipShape(Capsule())
-        .padding(.top, 8)
     }
 }

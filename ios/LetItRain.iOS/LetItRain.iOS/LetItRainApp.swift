@@ -3,7 +3,6 @@
 
 import SwiftUI
 import FirebaseCore
-import UserNotifications
 
 @main
 struct LetItRainApp: App {
@@ -13,7 +12,6 @@ struct LetItRainApp: App {
 
     init() {
         FirebaseApp.configure()
-        requestNotificationPermission()
     }
 
     var body: some Scene {
@@ -21,25 +19,6 @@ struct LetItRainApp: App {
             ContentView(connectionManager: connectionManager)
                 .environmentObject(authVM)
                 .environmentObject(connectionManager)
-        }
-    }
-
-    // MARK: - Push Notifications
-
-    private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(
-            options: [.alert, .sound, .badge]
-        ) { granted, error in
-            if let error {
-                print("Notification permission error:", error)
-            } else {
-                print("Notification permission granted:", granted)
-            }
-            if granted {
-                DispatchQueue.main.async {
-                    UIApplication.shared.registerForRemoteNotifications()
-                }
-            }
         }
     }
 }

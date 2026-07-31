@@ -47,8 +47,8 @@ class LCDStatus:
         self._lcd.write_text(text)
 
     def show_status(self, zone_text, next_text, ip_text, version_text):
-        self._draw_row(0, _row(zone_text, next_text))
-        self._draw_row(1, _row(ip_text, version_text))
+        self._draw_row(0, _row(zone_text, version_text))
+        self._draw_row(1, _row(next_text, ""))
 
     def show_message(self, message):
         """Single centered message, replacing all other content --

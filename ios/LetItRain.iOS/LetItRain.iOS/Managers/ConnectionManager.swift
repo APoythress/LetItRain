@@ -14,10 +14,26 @@
 //   4. If probe succeeds → local mode; otherwise → remote mode
 //
 // Re-evaluated:
-//   - Every 30 seconds while app is in foreground
+//   - On network path changes (NWPathMonitor -- Wi-Fi joined/left, etc.)
 //   - On every app foreground resume (sceneDidBecomeActive via NotificationCenter)
 //   - After any failed local API call (fast fallback)
 //   - The moment the Pico's meta/IP first loads or changes (DeviceViewModel)
+//
+// Deliberately NOT on a blind repeating timer: this used to also fire every
+// 45s, independently of DeviceViewModel's own (also timer-driven) local
+// status poll. Two independent timers hitting the Pico's single-threaded
+// HTTP server -- which handles exactly one connection at a time -- meant
+// they'd periodically collide, and whichever lost the race would blow past
+// its own timeout even though the Pico was perfectly reachable a moment
+// later. Event-driven re-evaluation covers every case that actually matters
+// (network changed, app came back to the foreground, a request just failed)
+// without a clock ticking in the background competing for that one
+// connection slot. Each evaluation is patient rather than being one single
+// attempt though: step 2 waits briefly for Firebase's meta listener to
+// deliver its first snapshot if it hasn't yet, and the probe in step 3
+// retries up to 4 times, since on a cold app launch the very first
+// evaluation is often racing data that just hasn't arrived yet rather than
+// a genuine "Pico unreachable."
 //
 // Diagnostics: every evaluation appends a `ConnectionDiagnostics.Entry` to
 // `history` (newest first, capped) and updates `lastEntry`. Both are
@@ -103,7 +119,6 @@ final class ConnectionManager: ObservableObject {
 
     private var pathMonitor: NWPathMonitor?
     private var monitorQueue = DispatchQueue(label: "com.letitrain.netmonitor")
-    private var evaluationTimer: Timer?
     private var currentPath: NWPath?
 
     /// Debounce floor between evaluations. Without this, a flapping Pico
@@ -122,12 +137,10 @@ final class ConnectionManager: ObservableObject {
 
     init() {
         startPathMonitor()
-        startPeriodicEvaluation()
         observeForegroundResume()
     }
 
     deinit {
-        evaluationTimer?.invalidate()
         pathMonitor?.cancel()
     }
 
@@ -160,13 +173,7 @@ final class ConnectionManager: ObservableObject {
         pathMonitor = monitor
     }
 
-    // MARK: - Periodic re-evaluation
-
-    private func startPeriodicEvaluation() {
-        evaluationTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
-            self?.evaluate(reason: "45s timer")
-        }
-    }
+    // MARK: - Foreground resume
 
     private func observeForegroundResume() {
         NotificationCenter.default.addObserver(
@@ -229,8 +236,18 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
-        // Step 2: Get the Pico's local IP from Firebase
-        let meta = await metaProvider?()
+        // Step 2: Get the Pico's local IP from Firebase. On a cold app
+        // launch this can race the Firebase listener's very first snapshot
+        // -- give it a few short retries before concluding there's
+        // genuinely no IP yet, rather than failing to remote on the first
+        // possible instant the listener just hasn't delivered anything.
+        var meta = await metaProvider?()
+        var metaRetries = 0
+        while (meta == nil || meta!.localIp.isEmpty || meta!.localIp == "0.0.0.0") && metaRetries < 4 {
+            metaRetries += 1
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            meta = await metaProvider?()
+        }
         trace.metaFound = meta != nil
         trace.localIp = meta?.localIp ?? "nil (metaProvider returned nothing)"
 
@@ -241,13 +258,41 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
-        // Step 3: Probe the Pico HTTP server. Generous timeout since the
-        // Pico's single-threaded HTTP server can be slow to accept a new
-        // connection if it's mid-request.
+        // Step 3: Probe the Pico HTTP server, up to 4 attempts with a short
+        // pause between each before concluding "remote" -- the Pico's
+        // single-threaded HTTP server can be mid-request for another caller
+        // for a moment, which shouldn't be enough on its own to flip the
+        // whole app to remote. Since evaluation is only event-driven now
+        // (no background timer -- see file header), it's worth being
+        // patient here rather than giving up after one blip.
         let probeURL = URL(string: "http://\(meta.localIp)/status")!
         trace.probeAttempted = true
         trace.probeURL = probeURL.absoluteString
 
+        var attempt = 0
+        while true {
+            attempt += 1
+            let (success, outcome, durationMs) = await probeOnce(probeURL)
+            trace.probeOutcome = outcome
+            trace.probeDurationMs = durationMs
+            if success {
+                mode = .local(baseURL: "http://\(meta.localIp)")
+                trace.finalMode = mode.displayName
+                trace.stoppedAt = "3: probe succeeded → local (attempt \(attempt))"
+                return
+            }
+            if attempt >= 4 { break }
+            try? await Task.sleep(nanoseconds: 750_000_000)
+        }
+
+        trace.stoppedAt = "3: probe did not return a healthy 200 after \(attempt) attempts"
+        mode = .remote
+        trace.finalMode = mode.displayName
+    }
+
+    /// Single probe attempt. Returns (succeeded, human-readable outcome for
+    /// diagnostics, duration in ms).
+    private func probeOnce(_ probeURL: URL) async -> (Bool, String, Int) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest  = 3
         config.timeoutIntervalForResource = 3
@@ -256,20 +301,13 @@ final class ConnectionManager: ObservableObject {
         let start = Date()
         do {
             let (_, response) = try await session.data(from: probeURL)
-            trace.probeDurationMs = Int(Date().timeIntervalSince(start) * 1000)
+            let durationMs = Int(Date().timeIntervalSince(start) * 1000)
             if let http = response as? HTTPURLResponse {
-                trace.probeOutcome = "HTTP \(http.statusCode)"
-                if http.statusCode == 200 {
-                    mode = .local(baseURL: "http://\(meta.localIp)")
-                    trace.finalMode = mode.displayName
-                    trace.stoppedAt = "3: probe succeeded → local"
-                    return
-                }
-            } else {
-                trace.probeOutcome = "non-HTTP response"
+                return (http.statusCode == 200, "HTTP \(http.statusCode)", durationMs)
             }
+            return (false, "non-HTTP response", durationMs)
         } catch {
-            trace.probeDurationMs = Int(Date().timeIntervalSince(start) * 1000)
+            let durationMs = Int(Date().timeIntervalSince(start) * 1000)
             // Logged (rather than swallowed) because the most common real
             // failure is the user denying the "Local Network" permission
             // prompt, which fails silently and looks identical to the Pico
@@ -278,17 +316,13 @@ final class ConnectionManager: ObservableObject {
             // typically surfaces as -1004 or -65554 ("No Network Route")
             // rather than a distinct error, so we log full details.
             let nsError = error as NSError
-            trace.probeOutcome = "\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)"
             logger.error("""
                 Local probe FAILED — url: \(probeURL.absoluteString, privacy: .public) \
                 error: \(nsError.domain, privacy: .public) \(nsError.code) \
                 \(nsError.localizedDescription, privacy: .public)
                 """)
+            return (false, "\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)", durationMs)
         }
-
-        trace.stoppedAt = "3: probe did not return a healthy 200"
-        mode = .remote
-        trace.finalMode = mode.displayName
     }
 
     private func record(_ entry: ConnectionDiagnostics) {

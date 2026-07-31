@@ -10,7 +10,6 @@
 		D9B5A9203006973200EAC544 /* GoogleService-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = D9B5A91F3006973200EAC544 /* GoogleService-Info.plist */; };
 		D9B5A923300697E800EAC544 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = D9B5A922300697E800EAC544 /* FirebaseAuth */; };
 		D9B5A925300697E800EAC544 /* FirebaseDatabase in Frameworks */ = {isa = PBXBuildFile; productRef = D9B5A924300697E800EAC544 /* FirebaseDatabase */; };
-		D9B5A927300697E800EAC544 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = D9B5A926300697E800EAC544 /* FirebaseMessaging */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,7 +59,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D9B5A927300697E800EAC544 /* FirebaseMessaging in Frameworks */,
 				D9B5A925300697E800EAC544 /* FirebaseDatabase in Frameworks */,
 				D9B5A923300697E800EAC544 /* FirebaseAuth in Frameworks */,
 			);
@@ -126,7 +124,6 @@
 			packageProductDependencies = (
 				D9B5A922300697E800EAC544 /* FirebaseAuth */,
 				D9B5A924300697E800EAC544 /* FirebaseDatabase */,
-				D9B5A926300697E800EAC544 /* FirebaseMessaging */,
 			);
 			productName = LetItRain.iOS;
 			productReference = D9B5A8D43006961E00EAC544 /* LetItRain.iOS.app */;
@@ -623,11 +620,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D9B5A921300697E800EAC544 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseDatabase;
-		};
-		D9B5A926300697E800EAC544 /* FirebaseMessaging */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = D9B5A921300697E800EAC544 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
-			productName = FirebaseMessaging;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

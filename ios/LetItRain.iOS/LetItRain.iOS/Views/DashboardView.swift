@@ -1,7 +1,7 @@
 // Views/DashboardView.swift
 // Main control screen. Multi-zone aware.
-// Local mode: zone selector + start/stop per zone.
-// Remote mode: read-only status + skip-today.
+// Local mode: zone selector + start/stop per zone, instant single-day skip.
+// Remote mode: read-only status (last run, last synced) + skip-for-N-days.
 
 import SwiftUI
 
@@ -10,12 +10,14 @@ struct DashboardView: View {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var deviceVM:          DeviceViewModel
 
-    @State private var selectedZone:    Int  = 1
-    @State private var selectedDuration: Int = 10
+    @State private var selectedZone:     Int  = 1
+    @State private var selectedDuration: Int  = 10
+    @State private var selectedSkipDays: Int  = 3
     @State private var showSkipConfirm  = false
     @State private var showCancelConfirm = false
 
     private let durationOptions = [5, 10, 15, 20, 30, 45, 60]
+    private let skipDayOptions  = [1, 2, 3, 5, 7, 14]
 
     private var enabledZones: [ZoneConfig] {
         deviceVM.config?.enabledZones ?? []
@@ -58,12 +60,20 @@ struct DashboardView: View {
             selectedDuration = cfg?.manualDefaultDurationMinutes ?? 10
             if let first = cfg?.enabledZones.first { selectedZone = first.id }
         }
-        .confirmationDialog("Skip today's scheduled run?",
+        .confirmationDialog(skipConfirmTitle,
                             isPresented: $showSkipConfirm, titleVisibility: .visible) {
-            Button("Skip Today", role: .destructive) { deviceVM.skipToday() }
+            Button(skipConfirmButtonLabel, role: .destructive) {
+                if connectionManager.mode.isLocal {
+                    deviceVM.skipToday()
+                } else {
+                    deviceVM.skipForDays(selectedSkipDays)
+                }
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The controller will receive this within 60 seconds.")
+            Text(connectionManager.mode.isLocal
+                 ? "The controller will receive this within 60 seconds."
+                 : "May take up to an hour to reach the device.")
         }
         .confirmationDialog("Cancel the skip?",
                             isPresented: $showCancelConfirm, titleVisibility: .visible) {
@@ -87,10 +97,14 @@ struct DashboardView: View {
     }
 
     private var lastSeenText: String {
-        let e = Date().timeIntervalSince1970 - deviceVM.status.lastHeartbeat
-        if e < 60    { return "Last seen \(Int(e))s ago" }
-        if e < 3600  { return "Last seen \(Int(e/60))m ago" }
-        return "Last seen \(Int(e/3600))h ago"
+        "Last seen \(syncedAgoText)"
+    }
+
+    private var syncedAgoText: String {
+        let e = Date().timeIntervalSince1970 - deviceVM.status.lastSyncedEpoch
+        if e < 60    { return "\(Int(e))s ago" }
+        if e < 3600  { return "\(Int(e/60))m ago" }
+        return "\(Int(e/3600))h ago"
     }
 
     // MARK: - Skip active banner
@@ -282,13 +296,13 @@ struct DashboardView: View {
 
                 if deviceVM.status.activeSkip {
                     Button { showCancelConfirm = true } label: {
-                        Label("Cancel Today's Skip", systemImage: "arrow.counterclockwise")
+                        Label("Cancel Skip", systemImage: "arrow.counterclockwise")
                             .font(.subheadline.weight(.medium)).foregroundColor(Color(hex: "FFA726"))
                             .frame(maxWidth: .infinity).padding()
                             .overlay(RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color(hex: "FFA726").opacity(0.5), lineWidth: 1))
                     }
-                } else {
+                } else if connectionManager.mode.isLocal {
                     Button { showSkipConfirm = true } label: {
                         Label("Skip Today's Run", systemImage: "calendar.badge.minus")
                             .font(.subheadline.weight(.medium)).foregroundColor(Color(hex: "FFA726"))
@@ -296,10 +310,54 @@ struct DashboardView: View {
                             .overlay(RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color(hex: "FFA726").opacity(0.5), lineWidth: 1))
                     }
+                } else {
+                    remoteSkipPicker
                 }
             }
             .padding().background(Color(hex: "0F2038")).cornerRadius(16)
         }
+    }
+
+    // MARK: - Remote skip-for-N-days (out-of-town override)
+
+    private var remoteSkipPicker: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Skip the schedule while you're away:")
+                .font(.caption).foregroundColor(.white.opacity(0.5))
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(skipDayOptions, id: \.self) { days in
+                        Button { selectedSkipDays = days } label: {
+                            Text(days == 1 ? "1 day" : "\(days) days")
+                                .font(.subheadline.weight(selectedSkipDays == days ? .semibold : .regular))
+                                .foregroundColor(selectedSkipDays == days ? .white : .white.opacity(0.5))
+                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                .background(selectedSkipDays == days ? Color(hex: "FFA726") : Color(hex: "1E2A3A"))
+                                .cornerRadius(20)
+                        }
+                    }
+                }
+            }
+            Button { showSkipConfirm = true } label: {
+                Label(skipConfirmButtonLabel, systemImage: "calendar.badge.minus")
+                    .font(.subheadline.weight(.medium)).foregroundColor(Color(hex: "FFA726"))
+                    .frame(maxWidth: .infinity).padding()
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color(hex: "FFA726").opacity(0.5), lineWidth: 1))
+            }
+        }
+    }
+
+    private var skipConfirmTitle: String {
+        connectionManager.mode.isLocal
+            ? "Skip today's scheduled run?"
+            : "Skip the schedule for \(selectedSkipDays) day\(selectedSkipDays == 1 ? "" : "s")?"
+    }
+
+    private var skipConfirmButtonLabel: String {
+        connectionManager.mode.isLocal
+            ? "Skip Today"
+            : "Skip \(selectedSkipDays) Day\(selectedSkipDays == 1 ? "" : "s")"
     }
 
     // MARK: - Device info
@@ -309,17 +367,33 @@ struct DashboardView: View {
             Text("Device Info").font(.footnote.weight(.semibold))
                 .foregroundColor(.white.opacity(0.5)).textCase(.uppercase).tracking(0.5)
 
-            infoRow("Firmware",  value: deviceVM.status.firmwareVersion ?? "—")
-            infoRow("Heartbeat", value: lastSeenText)
+            infoRow("Firmware",    value: deviceVM.status.firmwareVersion ?? "—")
+            infoRow("Last Synced", value: syncedAgoText)
 
             if let zones = deviceVM.config?.enabledZones, !zones.isEmpty {
                 infoRow("Zones", value: zones.map(\.name).joined(separator: ", "))
             }
 
             updateRow
+            if connectionManager.mode.isLocal { resyncTimeRow }
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(hex: "0F2038")).cornerRadius(16)
+    }
+
+    // MARK: - Clock resync row (local only -- the daily 3am job covers remote)
+
+    private var resyncTimeRow: some View {
+        HStack {
+            Text("Clock drifted?").font(.subheadline).foregroundColor(.white.opacity(0.5))
+            Spacer()
+            Button {
+                deviceVM.resyncTime()
+            } label: {
+                Text("Resync Time").font(.caption.weight(.semibold))
+            }
+            .disabled(deviceVM.isLoading)
+        }
     }
 
     // MARK: - OTA update row
@@ -330,22 +404,42 @@ struct DashboardView: View {
 
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Software Update").font(.subheadline).foregroundColor(.white.opacity(0.5))
-                if let message = deviceVM.otaStatus.message, deviceVM.otaStatus.status != "idle" {
+                HStack(spacing: 6) {
+                    Text("Software Update").font(.subheadline).foregroundColor(.white.opacity(0.5))
+                    if deviceVM.otaStatus.isUpdateAvailable {
+                        Circle().fill(Color(hex: "FFA726")).frame(width: 6, height: 6)
+                    }
+                }
+                if deviceVM.otaStatus.isUpdateAvailable, let version = deviceVM.otaStatus.availableVersion {
+                    Text("Version \(version) available").font(.caption2).foregroundColor(Color(hex: "FFA726"))
+                } else if let message = deviceVM.otaStatus.message, deviceVM.otaStatus.status != "idle" {
                     Text(message).font(.caption2).foregroundColor(.white.opacity(0.4))
                 }
             }
             Spacer()
-            Button {
-                deviceVM.checkForUpdate()
-            } label: {
-                if deviceVM.otaStatus.isInProgress {
-                    ProgressView().tint(.white.opacity(0.6))
-                } else {
-                    Text("Check Now").font(.caption.weight(.semibold))
+            if deviceVM.otaStatus.isUpdateAvailable {
+                Button {
+                    deviceVM.applyUpdate()
+                } label: {
+                    if deviceVM.otaStatus.isInProgress {
+                        ProgressView().tint(.white.opacity(0.6))
+                    } else {
+                        Text("Update Now").font(.caption.weight(.semibold)).foregroundColor(Color(hex: "FFA726"))
+                    }
                 }
+                .disabled(deviceVM.otaStatus.isInProgress)
+            } else {
+                Button {
+                    deviceVM.checkForUpdate()
+                } label: {
+                    if deviceVM.otaStatus.isInProgress {
+                        ProgressView().tint(.white.opacity(0.6))
+                    } else {
+                        Text("Check Now").font(.caption.weight(.semibold))
+                    }
+                }
+                .disabled(deviceVM.otaStatus.isInProgress || !deviceVM.status.isRecentlyOnline)
             }
-            .disabled(deviceVM.otaStatus.isInProgress || !deviceVM.status.isRecentlyOnline)
         }
     }
 

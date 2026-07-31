@@ -119,9 +119,7 @@ def _download_file(bucket, id_token, object_path, local_path):
     try:
         # Stream straight to disk in small pieces instead of resp.content,
         # which buffers the whole file as one contiguous bytes object and
-        # blows up with "memory allocation failed" once the heap is
-        # fragmented (Wi-Fi buffers, HTTP server thread, relay/RTC objects
-        # all share the same ~264KB SRAM).
+        # blows up with "memory allocation failed" 
         with open(local_path, "wb") as f:
             while True:
                 chunk = resp.raw.read(_DOWNLOAD_CHUNK_SIZE)

@@ -1,9 +1,13 @@
 # firebase/status_writer.py
 # Writes device status and metadata to Firebase.
 # Updated for multi-zone: includes active_zone_id in status.
+#
+# Ported to async (every write is now an await on FirebaseClient's httpx
+# calls). free_mem_bytes/min_free_mem_bytes are dropped -- they tracked
+# MicroPython's tiny fixed heap for OOM risk, which doesn't map to Linux's
+# virtual memory model, and the iOS app never displayed them.
 
 from core.unix_time import unix_time
-from core import mem_diag
 
 
 class StatusWriter:
@@ -15,8 +19,7 @@ class StatusWriter:
         self._version = firmware_version
         self._name    = device_name
 
-    def push_ip(self, local_ip, reset_cause=None, boot_count=None,
-                last_checkpoint=None, mpy_version=None):
+    async def push_ip(self, local_ip):
         zones = self._config.get("zones", [])
         enabled_count = len([z for z in zones if z.get("enabled")])
         data = {
@@ -25,24 +28,13 @@ class StatusWriter:
             "device_name":      self._name,
             "zone_count":       enabled_count,
         }
-        # Only set at boot (see main.py) -- omitted on the periodic re-push
-        # so this PATCH doesn't keep re-sending an increasingly stale
-        # boot-time snapshot.
-        if reset_cause is not None:
-            data["last_reset_cause"] = reset_cause
-        if boot_count is not None:
-            data["boot_count"] = boot_count
-        if last_checkpoint is not None:
-            data["last_checkpoint"] = last_checkpoint.get("checkpoint")
-        if mpy_version is not None:
-            data["mpy_version"] = mpy_version
-        ok = self._fb.patch("meta", data)
+        ok = await self._fb.patch("meta", data)
         if ok:
             print("Firebase: meta pushed (ip={})".format(local_ip))
         else:
             print("Firebase: meta push failed (non-fatal)")
 
-    def push_status(self, active_skip=False, active_skip_reason=None):
+    async def push_status(self, active_skip=False, active_skip_reason=None):
         s    = self._state
         last = self._config.get("last_run", {})
         data = {
@@ -57,36 +49,34 @@ class StatusWriter:
             "last_run_zone_id":   last.get("zone_id"),
             "last_run_status":    last.get("status"),
             "device_online":      True,
-            "last_heartbeat":     unix_time(),
+            "last_synced_epoch":  unix_time(),
             "active_skip":        active_skip,
             "active_skip_reason": active_skip_reason,
             "firmware_version":   self._version,
-            "free_mem_bytes":     mem_diag.sample(),
-            "min_free_mem_bytes": mem_diag.min_free(),
         }
-        if not self._fb.patch("status", data):
+        if not await self._fb.patch("status", data):
             print("Firebase: status push failed (non-fatal)")
 
-    def push_last_run(self, start_epoch, end_epoch, mode, zone_id, status_str):
+    async def push_last_run(self, start_epoch, end_epoch, mode, zone_id, status_str):
         data = {
-            "last_run_start":   start_epoch,
-            "last_run_end":     end_epoch,
-            "last_run_mode":    mode,
-            "last_run_zone_id": zone_id,
-            "last_run_status":  status_str,
-            "is_running":       False,
-            "active_zone_id":   None,
-            "current_mode":     "idle",
-            "run_started_at":   None,
-            "run_ends_at":      None,
-            "last_heartbeat":   unix_time(),
+            "last_run_start":    start_epoch,
+            "last_run_end":      end_epoch,
+            "last_run_mode":     mode,
+            "last_run_zone_id":  zone_id,
+            "last_run_status":   status_str,
+            "is_running":        False,
+            "active_zone_id":    None,
+            "current_mode":      "idle",
+            "run_started_at":    None,
+            "run_ends_at":       None,
+            "last_synced_epoch": unix_time(),
         }
-        if not self._fb.patch("status", data):
+        if not await self._fb.patch("status", data):
             print("Firebase: push_last_run failed (non-fatal)")
 
-    def push_offline(self):
-        self._fb.patch("status", {
-            "device_online":  False,
-            "last_heartbeat": unix_time(),
+    async def push_offline(self):
+        await self._fb.patch("status", {
+            "device_online":     False,
+            "last_synced_epoch": unix_time(),
         })
         print("Firebase: device marked offline")

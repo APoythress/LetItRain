@@ -18,8 +18,13 @@
 #
 # last_run_slots tracks {slot_key: epoch} so we don't double-fire.
 # slot_key = "monday_0", "monday_1", etc.
+#
+# now_epoch/local_epoch args are always the shifted "local wall clock epoch"
+# from core/unix_time.py's local_wall_clock_epoch() -- time.gmtime() on that
+# value yields local wall-clock fields directly, same trick the MicroPython
+# build used, just computed via zoneinfo now instead of a fixed offset.
 
-import utime
+import time
 
 
 DAY_NAMES = ["monday", "tuesday", "wednesday", "thursday",
@@ -27,8 +32,8 @@ DAY_NAMES = ["monday", "tuesday", "wednesday", "thursday",
 
 
 def _today_name(now_tuple):
-    """Return lowercase day name for the given utime.localtime() tuple."""
-    # utime weekday: 0=Mon … 6=Sun
+    """Return lowercase day name for the given time.gmtime() tuple."""
+    # tm_wday: 0=Mon … 6=Sun
     return DAY_NAMES[now_tuple[6]]
 
 
@@ -52,7 +57,7 @@ def get_pending_slot(schedule, state, last_run_slots, now_epoch):
     if state.is_running():
         return None, None   # never interrupt an active run
 
-    now_tuple   = utime.localtime(now_epoch)
+    now_tuple   = time.gmtime(now_epoch)
     today       = _today_name(now_tuple)
     day_schedule = schedule.get(today, {})
 
@@ -95,7 +100,7 @@ def get_next_slot(schedule, last_run_slots, now_epoch):
     Returns (day_name, hour, minute, zone_id), or None if no day has any
     enabled slots at all.
     """
-    now_tuple       = utime.localtime(now_epoch)
+    now_tuple       = time.gmtime(now_epoch)
     current_weekday = now_tuple[6]  # 0=Mon..6=Sun
     current_hour    = now_tuple[3]
     current_minute  = now_tuple[4]

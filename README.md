@@ -5,10 +5,33 @@
 
 | Mode   | How it works |
 |--------|-------------|
-| **Local** | iOS app ↔ Pico HTTP API directly over Wi-Fi. Full control. |
-| **Remote** | iOS app reads Firebase status (read-only). Can skip today's run. |
+| **Local** | iOS app ↔ Pico HTTP API directly over Wi-Fi. Full control — manual start/stop, schedule editing, instant OTA check. |
+| **Remote** | iOS app reads Firebase status (read-only) — last run time/zone/status, and when the device last synced. The only write available remotely is "skip the schedule for N days," for when you're out of town. |
 
-The Pico only ever **writes** to Firebase (status heartbeat every 30s, local IP on boot). It reads only the `overrides` node to check for skip signals. Firebase is never in the command path for relay control.
+The iOS app is **local-only for all control**. Remote never writes schedule/zone
+config, and never triggers start/stop — both require being on the same Wi-Fi
+as the Pico. This isn't just a UI restriction: the Firebase security rules
+(below) reject a `zones`/`schedule` write from the app regardless.
+
+The Pico writes to Firebase in one batched pass every 15 minutes (status,
+local IP, schedule push, OTA-trigger check) rather than on several independent
+timers — frequent TLS traffic is what wedges the Pico W's onboard WiFi chip,
+so cloud calls are kept rare and batched together. The one exception is
+`push_last_run()`, which still fires immediately whenever a run actually
+stops, so "last ran" doesn't wait for the next sync. It reads the
+`overrides` node to check for skip signals. Firebase is never in the command
+path for relay control.
+
+The iOS app itself doesn't poll the Pico on a timer either, for the same
+reason: on the local network, it fetches status once when a screen appears,
+once after any action (start/stop/skip), and once whenever it detects it's
+just joined the local network — not continuously in the background. A
+running zone's countdown needs no polling at all, since it's computed
+client-side from the fetched end time. Local/remote detection itself only
+re-runs on a network change, an app foreground, or a failed request — not a
+recurring timer — since two independent background timers (one for
+connectivity, one for status) both polling the Pico's single-threaded HTTP
+server used to occasionally collide and produce spurious "offline" flips.
 
 **Safety net:** a hardware watchdog (`machine.WDT`, 8s timeout) is armed once boot completes. It's fed after each network operation in the main loop and every 100ms while idle — if the loop ever stops reaching those points for 8 seconds (a hang of any kind, regardless of cause), the board hard-resets. `relay.all_off()` unconditionally runs first on every boot, so a stuck-open zone always gets shut off within seconds even if the software issue that caused the hang is never diagnosed.
 
@@ -51,11 +74,11 @@ In Realtime Database → Rules, paste the following as-is — **no UID needs to 
         },
         "zones": {
           ".read": "auth != null && (auth.uid === root.child('devices').child($device_id).child('device_owner_uid').val() || root.child('users').child(auth.uid).child('device_id').val() === $device_id)",
-          ".write": "auth != null && root.child('users').child(auth.uid).child('device_id').val() === $device_id"
+          ".write": "auth != null && auth.uid === root.child('devices').child($device_id).child('device_owner_uid').val()"
         },
         "schedule": {
           ".read": "auth != null && (auth.uid === root.child('devices').child($device_id).child('device_owner_uid').val() || root.child('users').child(auth.uid).child('device_id').val() === $device_id)",
-          ".write": "auth != null && root.child('users').child(auth.uid).child('device_id').val() === $device_id"
+          ".write": "auth != null && auth.uid === root.child('devices').child($device_id).child('device_owner_uid').val()"
         },
         "update": {
           ".read": "auth != null && (auth.uid === root.child('devices').child($device_id).child('device_owner_uid').val() || root.child('users').child(auth.uid).child('device_id').val() === $device_id)",
@@ -66,8 +89,7 @@ In Realtime Database → Rules, paste the following as-is — **no UID needs to 
     "users": {
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
-        "device_id": { ".write": false },
-        "fcm_token": { ".write": "auth != null && auth.uid === $uid" }
+        "device_id": { ".write": false }
       }
     }
   }
@@ -75,8 +97,8 @@ In Realtime Database → Rules, paste the following as-is — **no UID needs to 
 ```
 
 Two different ownership mechanisms, deliberately:
-- **`device_owner_uid`** (gates `meta`/`status`) is **self-claimed**: whichever account first authenticates and writes there becomes its permanent owner. Safe because only the one physical Pico that holds that device account's credentials (in its own `secrets.py`) will ever attempt that write — this is what removes the old "look up your Pico's UID and hand-paste it into the rules" step entirely. Two Picos left on the same default `FIREBASE_DEVICE_ID` will race for this; whichever loses gets a clear, specific rejection at boot rather than a confusing generic one (see `main.py`'s device_owner_uid claim step).
-- **`users/{uid}/device_id`** (gates `zones`/`schedule`/`overrides`/`update` — i.e. app control) is **admin-assigned only** (`.write: false` — set it from the Console's Data tab, never from the app). This is intentionally *not* self-claimable: in a shared project, letting a signed-in user write their own `users/{uid}/device_id` would let them grant themselves control of anyone else's device just by writing that field. See "Onboarding a new device" below for the exact steps.
+- **`device_owner_uid`** (gates `meta`/`status`, and now also `zones`/`schedule` writes) is **self-claimed**: whichever account first authenticates and writes there becomes its permanent owner. Safe because only the one physical Pico that holds that device account's credentials (in its own `secrets.py`) will ever attempt that write — this is what removes the old "look up your Pico's UID and hand-paste it into the rules" step entirely. Two Picos left on the same default `FIREBASE_DEVICE_ID` will race for this; whichever loses gets a clear, specific rejection at boot rather than a confusing generic one (see `main.py`'s device_owner_uid claim step). Restricting `zones`/`schedule` writes to this same owner UID (rather than any assigned app user) is what makes "the app is local-only for schedule editing" a security-rules guarantee, not just a UI choice — the app was never given write access to begin with.
+- **`users/{uid}/device_id`** (gates read access to `zones`/`schedule`, and both read+write of `overrides`/`update` — i.e. remote skip-for-N-days and OTA-trigger) is **admin-assigned only** (`.write: false` — set it from the Console's Data tab, never from the app). This is intentionally *not* self-claimable: in a shared project, letting a signed-in user write their own `users/{uid}/device_id` would let them grant themselves control of anyone else's device just by writing that field. See "Onboarding a new device" below for the exact steps.
 
 ### 4. Enable Authentication
 - Build → Authentication → Get started → Email/Password → Enable
@@ -121,10 +143,11 @@ devices/
       is_running: false
       current_mode: "idle"
       device_online: false
-      last_heartbeat: 0
+      last_synced_epoch: 0
       active_skip: false
     overrides/
-      skip_today: false
+      skip_active: false
+      skip_until: null
 ```
 
 ### 9. Onboarding a new device (yourself first, then any friends)
@@ -138,6 +161,8 @@ Whether it's your own first device or a friend's, the steps are the same — thi
 5. In Realtime Database → Data, **manually set `users/{their_personal_uid}/device_id = "{their_device_id}"`**. This is the one step that must be done from the Console — the rules deliberately don't allow the app to write this field itself (see the security rules note above), since that's what stops one person from granting themselves access to someone else's device.
 
 After step 5, their app shows only their own device's status/schedule, and their Pico only ever reads/writes its own node — cross-device access is rejected by the rules regardless of what either side's code does.
+
+**If the app is stuck showing "Your account isn't assigned to a device yet"** — this is always step 5 above not having been done yet for that account (or done for the wrong UID). This applies to your own first device too, not just friends' — signing into the app does *not* automatically grant it access to anything; someone has to go into the Console and set `users/{your_personal_uid}/device_id` by hand, exactly once. Note this is a **different** field from `devices/{device_id}/device_owner_uid` (which the Pico sets on itself, automatically, and which you should not need to touch by hand) — mixing the two up is easy to do and won't fix this error.
 
 ### 1. Fill in secrets.py
 Edit `secrets.py` and replace every `REPLACE_ME` value:
@@ -294,29 +319,32 @@ The Pico checks for a new firmware version on every boot and every 6 hours while
 Check `update_status.json` on the device (via Thonny), or `devices/{id}/update` in Firebase, for the current state (`idle` / `checking` / `downloading` / `staged` / `error`) if an update doesn't seem to be landing.
 
 ### Manual "check now" from the app
-The Dashboard's Device Info card has a "Check for Update" button — it writes `devices/{id}/update/requested = true`. The Pico checks that flag every 45s, clears it immediately so it only fires once, and runs `check_for_update()` right away instead of waiting for the 6-hour timer. Current status/progress is pushed to the same `update` node every 45s so the app can show it live.
+The Dashboard's Device Info card has a "Check for Update" button.
+- **Local mode**: posts directly to the Pico's `/check-update` HTTP endpoint, which runs `check_for_update()` immediately in that request — instant, no Firebase round-trip.
+- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched cloud-sync pass (see Architecture above), so a remote-triggered check can take up to 15 minutes to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same pass.
+
+---
+
+## Clock Sync
+
+The Pico syncs its clock from NTP at boot, mirrors it into the DS3231 (if wired), and re-syncs automatically **once daily at 3am local time** — the DS3231's own crystal drifts a little over weeks/months of continuous uptime, and this controller is meant to run for a long time between reboots. NTP is plain UDP (port 123), not TLS, so this doesn't compete with the WiFi-chip concerns the rest of this document is careful about — it's fine for this to run on its own schedule, independent of the batched Firebase cloud-sync pass.
+
+**Manual resync**: the Dashboard's Device Info card has a "Resync Time" button, local mode only — it posts directly to the Pico's `POST /resync-time` endpoint for an instant resync. This isn't offered remotely; the daily automatic job already covers the underlying need without a Firebase round-trip.
+
+---
+
+## Boot Diagnostics
+
+Every boot writes `boot_log.json` to the device's flash, readable via `GET /boot-log` on the local network (e.g. `http://<pico-ip>/boot-log` from a browser, or `curl`) — no serial console or physical access required. Useful when the board is somewhere inconvenient to reach (this is local-network only, same as every other endpoint here — it's not reachable from outside your Wi-Fi).
+
+Fields: `firmware_version`, `zones_configured`, `lcd_present`, `rtc_present`, `wifi_connected`, `local_ip`, `wifi_error`, `ntp_synced`, `boot_epoch`, `firebase_auth_ok`, `firebase_auth_error`, `firebase_uid`, `expected_uid_mismatch`, `device_owner_uid_claimed` (`true`/`false`/`null` if never attempted because auth failed), `heap_total_bytes`, `free_mem_bytes_at_boot`.
+
+If the endpoint 404s with "no boot log available yet," the device hasn't rebooted since this feature was added — power-cycle it once.
 
 ---
 
 ## iOS App Setup
 See `ios/README.md` for Xcode setup, Firebase SDK, and App Store submission steps.
-
----
-
-## Firebase Cloud Functions (Push Notifications)
-
-```bash
-cd cloud_functions
-npm install
-firebase login
-firebase use --add    # select LetItRain project
-firebase deploy --only functions
-```
-
-After deploying, find your user UID (Firebase Console → Authentication → Users) and set it:
-```bash
-firebase functions:config:set app.user_uid="YOUR_UID_HERE"
-```
 
 ---
 
@@ -338,13 +366,12 @@ LetItRain/
 ├── firebase/
 │   ├── client.py              ← Firebase REST client (MicroPython)
 │   ├── status_writer.py       ← Writes status/meta to Firebase
-│   └── override_reader.py     ← Reads skip-today overrides from Firebase
+│   └── override_reader.py     ← Reads skip-for-N-days overrides from Firebase
 ├── web/server.py              ← Local HTTP JSON API (trimmed, no HTML UI)
 ├── core/                      ← Scheduler + state (unchanged)
 ├── hardware/                  ← Relay + DS3231 (unchanged)
 ├── storage/                   ← Config persistence (unchanged)
 ├── cloud_functions/           ← Firebase Cloud Functions (Node.js)
-│   ├── index.js               ← Push notifications on run start/stop
 │   └── ifttt_rain_hook.js     ← STUB: IFTTT rain integration (v1.2)
 └── ios/                       ← iOS SwiftUI app source
     ├── README.md              ← Xcode setup instructions

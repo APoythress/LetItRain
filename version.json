@@ -1,4 +1,0 @@
-{
-  "version": "1.2.0",
-  "notes": "Multi-zone scheduler. Up to 5 zones with individual GPIO pin mapping. Multiple time slots per day per zone. Auto-builder in iOS app. Firebase schedule/zone sync (read + write). IFTTT rain hook stub retained."
-}
