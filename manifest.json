@@ -1,8 +1,18 @@
 {
-  "version": "1.3.10",
+  "version": "1.2.17",
   "files": [
     { "path": "main.py" },
-    { "path": "version.json"},
-    { "path": "firebase/schedule_sync.py" }
+    { "path": "core/mem_diag.py"},
+    { "path": "core/scheduler.py" },
+    { "path": "firebase/client.py" },
+    { "path": "firebase/status_writer.py" },
+    { "path": "update/updater.py" },
+    { "path": "web/server.py" },
+    { "path": "hardware/lcd1602.py" },
+    { "path": "hardware/lcd_status.py" }
+  ],
+  "deletes": [
+    "core/time_utils.py",
+    "web/html.py"
   ]
 }
