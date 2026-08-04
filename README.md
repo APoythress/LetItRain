@@ -1,45 +1,62 @@
-# LetItRain v1.1.0
-**Raspberry Pi Pico W sprinkler controller with iOS app control**
+# LetItRain v2.0.0-alpha
+**Raspberry Pi 3 A+ sprinkler controller with iOS app control**
+
+This supersedes the earlier Raspberry Pi Pico W build — the device is now a
+full Linux box (Raspberry Pi OS Lite, 64-bit) running CPython under
+`systemd`, not MicroPython. See `RPI/` for the device firmware/software,
+`RPI/deploy/README.md` for first-boot setup, and
+`RPI/hardware/GPIO_PINOUT.md` for wiring a new physical unit end to end.
 
 ## Architecture
 
 | Mode   | How it works |
 |--------|-------------|
-| **Local** | iOS app ↔ Pico HTTP API directly over Wi-Fi. Full control — manual start/stop, schedule editing, instant OTA check. |
-| **Remote** | iOS app reads Firebase status (read-only) — last run time/zone/status, and when the device last synced. The only write available remotely is "skip the schedule for N days," for when you're out of town. |
+| **Local** | iOS app ↔ Pi's local FastAPI server directly over Wi-Fi. Full control — manual start/stop, schedule/zone editing, instant update checks. |
+| **Remote** | iOS app reads Firebase status (read-only) — last run time/zone/status, and when the device last synced. Remote writes available: "skip the schedule for N days" (out-of-town use case), and confirming an already-detected software update. |
 
-The iOS app is **local-only for all control**. Remote never writes schedule/zone
-config, and never triggers start/stop — both require being on the same Wi-Fi
-as the Pico. This isn't just a UI restriction: the Firebase security rules
-(below) reject a `zones`/`schedule` write from the app regardless.
+The iOS app is **local-only for schedule/zone editing and manual start/stop**
+— both require being on the same Wi-Fi as the Pi. This isn't just a UI
+restriction: the Firebase security rules (below) reject a `zones`/`schedule`
+write from the app regardless of what the client attempts.
 
-The Pico writes to Firebase in one batched pass every 15 minutes (status,
-local IP, schedule push, OTA-trigger check) rather than on several independent
-timers — frequent TLS traffic is what wedges the Pico W's onboard WiFi chip,
-so cloud calls are kept rare and batched together. The one exception is
-`push_last_run()`, which still fires immediately whenever a run actually
-stops, so "last ran" doesn't wait for the next sync. It reads the
-`overrides` node to check for skip signals. Firebase is never in the command
-path for relay control.
+Unlike the old Pico build's single batched 15-minute Firebase sync pass
+(that batching existed specifically to avoid wedging the Pico W's onboard
+WiFi chip under frequent TLS traffic — a full Linux network stack has no
+equivalent failure mode), the Pi runs each concern on its own independent
+`asyncio` task and cadence:
 
-The iOS app itself doesn't poll the Pico on a timer either, for the same
-reason: on the local network, it fetches status once when a screen appears,
-once after any action (start/stop/skip), and once whenever it detects it's
-just joined the local network — not continuously in the background. A
-running zone's countdown needs no polling at all, since it's computed
-client-side from the fetched end time. Local/remote detection itself only
-re-runs on a network change, an app foreground, or a failed request — not a
-recurring timer — since two independent background timers (one for
-connectivity, one for status) both polling the Pico's single-threaded HTTP
-server used to occasionally collide and produce spurious "offline" flips.
+- Status → Firebase: every 60s
+- Zones/schedule/IP → Firebase: every 300s automatically, **and immediately**
+  whenever `/config` actually changes zones or schedule (a save doesn't wait
+  for the next periodic cycle)
+- RTC mirror (if wired): every hour
+- Update check: every 6h, or immediately on a manual "Check Now"/"Update Now"
+- Firebase is never in the command path for relay control — schedule
+  execution and manual start/stop are entirely local.
 
-**Safety net:** a hardware watchdog (`machine.WDT`, 8s timeout) is armed once boot completes. It's fed after each network operation in the main loop and every 100ms while idle — if the loop ever stops reaching those points for 8 seconds (a hang of any kind, regardless of cause), the board hard-resets. `relay.all_off()` unconditionally runs first on every boot, so a stuck-open zone always gets shut off within seconds even if the software issue that caused the hang is never diagnosed.
+The iOS app doesn't poll on a fixed timer either: it fetches status once
+when a screen appears, once after any action (start/stop/skip), and once
+whenever it detects it's just joined the local network. A running zone's
+countdown needs no polling — it's computed client-side from the fetched end
+time. Local/remote mode detection re-evaluates on network changes, app
+foreground, or a failed request, not a recurring timer, to avoid two
+independent timers colliding against the Pi's single-threaded local API.
+
+**Safety net:** `systemd` owns process supervision and a hardware watchdog
+(`WatchdogSec=30` in `deploy/letitrain.service`, fed via `sd_notify` every
+10s — see `main.py`'s `watchdog_loop()`). If the event loop ever stops
+reaching that heartbeat for any reason (a hang of any kind), `systemd`
+hard-restarts the service. `relay.all_off()` unconditionally runs first on
+every boot, so a stuck-open zone always gets shut off within seconds
+regardless of what caused the restart.
 
 ---
 
 ## Firebase Setup (Required Before First Use)
 
-Complete these steps in the Firebase Console **before** flashing the Pico or building the iOS app.
+Complete these steps in the Firebase Console **before** setting up the Pi or
+building the iOS app. This section is unchanged from the Pico build — the
+schema and security rules carried over as-is.
 
 ### 1. Create Project
 - https://console.firebase.google.com → Add project → `LetItRain`
@@ -97,8 +114,8 @@ In Realtime Database → Rules, paste the following as-is — **no UID needs to 
 ```
 
 Two different ownership mechanisms, deliberately:
-- **`device_owner_uid`** (gates `meta`/`status`, and now also `zones`/`schedule` writes) is **self-claimed**: whichever account first authenticates and writes there becomes its permanent owner. Safe because only the one physical Pico that holds that device account's credentials (in its own `secrets.py`) will ever attempt that write — this is what removes the old "look up your Pico's UID and hand-paste it into the rules" step entirely. Two Picos left on the same default `FIREBASE_DEVICE_ID` will race for this; whichever loses gets a clear, specific rejection at boot rather than a confusing generic one (see `main.py`'s device_owner_uid claim step). Restricting `zones`/`schedule` writes to this same owner UID (rather than any assigned app user) is what makes "the app is local-only for schedule editing" a security-rules guarantee, not just a UI choice — the app was never given write access to begin with.
-- **`users/{uid}/device_id`** (gates read access to `zones`/`schedule`, and both read+write of `overrides`/`update` — i.e. remote skip-for-N-days and OTA-trigger) is **admin-assigned only** (`.write: false` — set it from the Console's Data tab, never from the app). This is intentionally *not* self-claimable: in a shared project, letting a signed-in user write their own `users/{uid}/device_id` would let them grant themselves control of anyone else's device just by writing that field. See "Onboarding a new device" below for the exact steps.
+- **`device_owner_uid`** (gates `meta`/`status`, and `zones`/`schedule` writes) is **self-claimed**: whichever account first authenticates and writes there becomes its permanent owner. Safe because only the one physical device that holds that device account's credentials (in its own `device_secrets.py`) will ever attempt that write — this removes the old "look up your device's UID and hand-paste it into the rules" step entirely. Two devices left on the same default `FIREBASE_DEVICE_ID` will race for this; whichever loses gets a clear, specific rejection at boot (see `main.py`'s `device_owner_uid` claim step). Restricting `zones`/`schedule` writes to this same owner UID (rather than any assigned app user) is what makes "the app is local-only for schedule editing" a security-rules guarantee, not just a UI choice.
+- **`users/{uid}/device_id`** (gates read access to `zones`/`schedule`, and read+write of `overrides`/`update` — i.e. remote skip-for-N-days and update confirmation) is **admin-assigned only** (`.write: false` — set it from the Console's Data tab, never from the app). This is intentionally *not* self-claimable: in a shared project, letting a signed-in user write their own `users/{uid}/device_id` would let them grant themselves control of anyone else's device.
 
 ### 4. Enable Authentication
 - Build → Authentication → Get started → Email/Password → Enable
@@ -111,235 +128,190 @@ In Authentication → Users → Add user:
 - Password: strong password you'll remember
 - Note the UID shown in the Users table — you'll assign it to your own device in step 9 below
 
-**Pico device account**:
-- Email: `pico-device@letitrain.local`
+**Device account** (one per physical Pi):
+- Email: e.g. `device-name@letitrain.local`
 - Password: generate a random 40-character string (use a password manager)
 - No UID copying needed here — the security rules above let this account self-claim ownership of its device_id automatically on first boot
-- **Keep the password somewhere safe** — you'll need it for `secrets.py`
+- **Keep the password somewhere safe** — you'll need it for `device_secrets.py`
 
 ### 6. Collect Credentials
 You'll need these in the next steps:
 - **Web API Key**: Project Settings → General → Your apps → Web API Key
 - **Database URL**: Realtime Database panel → the URL at the top (e.g. `https://letitrain-default-rtdb.firebaseio.com`)
-- **Pico device email**: `pico-device@letitrain.local`
-- **Pico device password**: the 40-char string from step 5
+- **Storage bucket name**: Build → Storage panel → the bucket name at the top (e.g. `letitrain-75815.appspot.com`) — not currently used by the OTA mechanism (see below), but collected alongside the rest since `device_secrets.py` has a field for it
+- **Device account email/password**: from step 5
 
 ### 7. Register iOS App
 - Project Settings → Your apps → Add app → iOS
-- Bundle ID: `com.yourname.letitrain` (match what you'll use in Xcode)
+- Bundle ID: match what you'll use in Xcode
 - Download `GoogleService-Info.plist` → add to Xcode project
 
 ### 8. Initialize Database Schema
-In Realtime Database → Data, manually create this structure (or let the Pico write it on first boot):
+This gets created automatically by the device on first successful boot —
+nothing to do by hand here unless you want to pre-seed it. Shape, for
+reference:
 
 ```
 devices/
-  pico-zone-1/
+  {device_id}/
+    device_owner_uid: "<self-claimed on first boot>"
     meta/
-      local_ip: "0.0.0.0"
-      firmware_version: "1.1.0"
-      device_name: "Pico Sprinkler Controller"
+      local_ip: "192.168.x.x"
+      firmware_version: "2.0.0-alpha"
+      device_name: "LetItRain Controller"
     status/
       is_running: false
       current_mode: "idle"
       device_online: false
       last_synced_epoch: 0
       active_skip: false
+    zones/
+      1: { name: "Front Garden", pin: 5, enabled: true }
+      ...
+    schedule/
+      monday: { enabled: true, slots: [...] }
+      ...
     overrides/
       skip_active: false
       skip_until: null
+    update/
+      status: "idle"
+      current_version: "2.0.0-alpha"
+      available_version: null
 ```
 
 ### 9. Onboarding a new device (yourself first, then any friends)
 
 Whether it's your own first device or a friend's, the steps are the same — this project supports many people sharing one Firebase project, each cryptographically confined to their own `device_id`:
 
-1. **Create two Firebase Auth accounts** for this person (Authentication → Users → Add user), same pattern as step 5: a personal account (for their iOS app) and a device account (for their Pico). Give them the device account's email/password and a device password to keep private.
-2. **Pick a `FIREBASE_DEVICE_ID`** unique across everyone sharing this project (e.g. `west-home`, `friend-name-backyard`) and give it to them to put in their `secrets.py`, alongside their device account's email/password.
-3. Have them **flash their Pico and boot it once**. The device account self-claims `devices/{their_device_id}/device_owner_uid` automatically — nothing to copy or paste for this part.
+1. **Create two Firebase Auth accounts** for this person (Authentication → Users → Add user), same pattern as step 5: a personal account (for their iOS app) and a device account (for their Pi). Give them the device account's email/password to put in their own `device_secrets.py`.
+2. **Pick a `FIREBASE_DEVICE_ID`** unique across everyone sharing this project (e.g. `west-home`, `friend-name-backyard`) and give it to them, alongside their device account's email/password.
+3. Have them **set up their Pi and boot it once** (see `RPI/deploy/README.md`). The device account self-claims `devices/{their_device_id}/device_owner_uid` automatically — nothing to copy or paste for this part.
 4. Have them **sign into the iOS app once** with their personal account (this creates their Firebase Auth user session, giving you their UID to reference).
-5. In Realtime Database → Data, **manually set `users/{their_personal_uid}/device_id = "{their_device_id}"`**. This is the one step that must be done from the Console — the rules deliberately don't allow the app to write this field itself (see the security rules note above), since that's what stops one person from granting themselves access to someone else's device.
+5. In Realtime Database → Data, **manually set `users/{their_personal_uid}/device_id = "{their_device_id}"`**. This is the one step that must be done from the Console — the rules deliberately don't allow the app to write this field itself, since that's what stops one person from granting themselves access to someone else's device.
 
-After step 5, their app shows only their own device's status/schedule, and their Pico only ever reads/writes its own node — cross-device access is rejected by the rules regardless of what either side's code does.
+After step 5, their app shows only their own device's status/schedule, and their Pi only ever reads/writes its own node — cross-device access is rejected by the rules regardless of what either side's code does.
 
-**If the app is stuck showing "Your account isn't assigned to a device yet"** — this is always step 5 above not having been done yet for that account (or done for the wrong UID). This applies to your own first device too, not just friends' — signing into the app does *not* automatically grant it access to anything; someone has to go into the Console and set `users/{your_personal_uid}/device_id` by hand, exactly once. Note this is a **different** field from `devices/{device_id}/device_owner_uid` (which the Pico sets on itself, automatically, and which you should not need to touch by hand) — mixing the two up is easy to do and won't fix this error.
-
-### 1. Fill in secrets.py
-Edit `secrets.py` and replace every `REPLACE_ME` value:
-
-```
-WIFI_SSID       = "your home Wi-Fi name"
-WIFI_PASSWORD   = "your Wi-Fi password"
-FIREBASE_API_KEY    = "AIzaSy..."       ← Web API Key from Firebase
-FIREBASE_EMAIL      = "pico-device@letitrain.local"
-FIREBASE_PASSWORD   = "your-40-char-pico-account-password"
-FIREBASE_DB_URL     = "https://letitrain-default-rtdb.firebaseio.com"
-FIREBASE_DEVICE_ID  = "pico-zone-1"   ← must be unique across everyone sharing this Firebase project, see "Onboarding a new device" above
-FIREBASE_STORAGE_BUCKET = "your-project-id.appspot.com"   ← see OTA Updates section below
-UTC_OFFSET_HOURS    = -5   ← your timezone's STANDARD offset from UTC, e.g. -5 for US Eastern, -6 Central, -7 Mountain, -8 Pacific
-# FIREBASE_EXPECTED_UID = "..."   ← optional, leave commented out on first boot; see below
-```
-
-`UTC_OFFSET_HOURS` is used only for matching your schedule's local start times and determining "today" for skip-day — it does not affect Firebase timestamps, which are always true UTC. MicroPython has no timezone/DST database, so this is a fixed manual number: pick standard time (not daylight saving) and expect scheduled runs to drift by an hour during DST, or update the value twice a year if you want to track it exactly.
-
-`FIREBASE_EXPECTED_UID` is an optional cross-check, not something you fill in up front: after this device's first successful boot ("Firebase: authenticated OK" in the serial console), find its UID in Firebase Console → Authentication → Users and paste it in. Every later boot then loudly warns if the credentials above ever end up on the wrong physical board (e.g. a friend's `secrets.py` copied onto this one by mistake) instead of failing silently/confusingly via a rejected write several steps later.
-
-### 2. Flash Files to Pico
-Copy all `.py` files and folders to the Pico (using Thonny or rshell):
-```
-main.py
-secrets.py
-version.json
-config.json
-netcfg/wifi.py
-firebase/__init__.py
-firebase/client.py
-firebase/status_writer.py
-firebase/override_reader.py
-firebase/schedule_sync.py
-web/server.py
-core/scheduler.py
-core/state.py
-core/unix_time.py
-core/mem_diag.py
-hardware/relay.py
-hardware/ds3231.py
-hardware/status_led.py
-hardware/lcd1602.py
-hardware/lcd_status.py
-storage/config_store.py
-update/updater.py
-```
-
-### 3. Router — DHCP Reservation (Recommended)
-Find the Pico's MAC address (printed in serial output on first boot) and create a DHCP reservation in your router so its IP never changes. Alternatively, the app reads the IP from Firebase on every connection — both approaches work.
-
-### 4. Status LED Wiring
-
-Two indicator LEDs (green + red) show boot/connectivity state without needing a serial console.
-
-| LED   | Pico Pin        | Notes |
-|-------|------------------|-------|
-| Green | GPIO16 (pin 21) | Boot / running status |
-| Red   | GPIO17 (pin 22) | Connectivity / failure status |
-
-Wiring for each LED (standard 5mm indicator LED):
-```
-GPIO pin ──► 220–330Ω resistor ──► LED anode (long leg)
-LED cathode (short leg) ──► GND (any GND pin, e.g. physical pin 18 or 23)
-```
-GPIO16/17 drive HIGH = 3.3V, which is within spec for a standard LED + resistor — no transistor needed. Do not skip the resistor; driving an LED directly off a GPIO pin with no resistor can damage the pin.
-
-**Behavior:**
-| State | Green | Red |
-|-------|-------|-----|
-| Booting (Wi-Fi/Firebase connecting) | flash 3s on / 1s off | off |
-| Running normally (Firebase reachable) | solid on | off |
-| Running, no internet/Firebase | solid on | flash 5s on / 2s off |
-| Boot failed (unrecoverable startup error) | off | flash rapidly, 150ms on / 150ms off |
-
-Pin numbers are set in `hardware/status_led.py` → `StatusLED(green_pin=16, red_pin=17)` in `main.py` — change both if you wire to different GPIOs. GPIO16/17 were picked because they're free: I2C uses GPIO0/1, and zone relays use GPIO11–15.
-
-### 5. 16x2 LCD Wiring (optional)
-
-A 16x2 character LCD on an [Adafruit Character LCD Backpack](https://www.adafruit.com/product/292) in its SPI/shift-register mode shows live status without a serial console. This backpack exposes 5 pins — LAT, DAT, CLK, 3-5V, GND — driving the LCD through an onboard 74HC595 shift register rather than I2C.
-
-| Backpack Pin | Pico Pin |
-|--------------|----------|
-| LAT | GPIO20 |
-| DAT | GPIO19 |
-| CLK | GPIO18 |
-| 3-5V | 3V3 (physical pin 36) |
-| GND | any GND pin |
-
-Pin numbers are set in `hardware/lcd1602.py`'s instantiation in `main.py` — `LCD1602(dat_pin=18, clk_pin=19, lat_pin=20)` — change if you wire to different GPIOs. GPIO18–20 were picked because they're free alongside the status LEDs (16/17) and relays (11–15).
-
-**Layout** (updates automatically, redrawing only the fields that changed):
-```
-Zone 3      Tue 05:00
-1.100        v1.2.16
-```
-Top-left: active zone, or "Idle". Top-right: next scheduled run. Bottom-left: local IP (shortened to its last two octets if the full address plus the version won't both fit). Bottom-right: firmware version.
-
-The display is optional — if unwired or faulty, `main.py` logs it and continues without one; nothing else on the controller depends on it.
-
-### 6. Verify
-Open a serial terminal (Thonny works). You should see:
-```
-LetItRain v1.1.0 booting...
-Connecting to Wi-Fi: YourSSID
-Wi-Fi connected on attempt N
-Firebase: authenticated OK
-Firebase: meta/local_ip pushed: 192.168.x.x
-HTTP server listening on port 80
-Main loop started.
-```
+**If the app is stuck showing "Your account isn't assigned to a device yet"** — this is always step 5 above not having been done yet for that account (or done for the wrong UID). This applies to your own first device too, not just friends' — signing into the app does *not* automatically grant it access to anything; someone has to go into the Console and set `users/{your_personal_uid}/device_id` by hand, exactly once. Note this is a **different** field from `devices/{device_id}/device_owner_uid` (which the device sets on itself, automatically) — mixing the two up is easy to do and won't fix this error.
 
 ---
 
-## OTA Updates (via Firebase Cloud Storage)
+## Setting Up a Physical Device
 
-The Pico checks for a new firmware version on every boot and every 6 hours while running, over the internet — it does **not** need to be on the same Wi-Fi network as the machine that published the update. If a newer version is found, it downloads the files listed in the manifest and reboots into them as soon as no zone is actively running (never mid-cycle).
+Full first-boot-to-running-service instructions live in
+**`RPI/deploy/README.md`** (flashing the SD card, enabling I2C/watchdog,
+cloning the repo, installing the systemd service). Full wiring reference —
+every GPIO connection, what each pin is for, and the LCD backpack's I2C
+mode gotcha — lives in **`RPI/hardware/GPIO_PINOUT.md`**. Both are written
+to be followed start to finish without needing to read the source first.
 
-### One-time setup
-1. Firebase Console → **Build → Storage** → get started (default bucket is fine).
-2. Rules tab → publish:
+At a high level: clone this repo to `/opt/letitrain` on the Pi, fill in
+`RPI/device_secrets.py` (gitignored, per-device — not part of the clone):
+
+```
+FIREBASE_API_KEY        = "AIzaSy..."       ← Web API Key from Firebase
+FIREBASE_EMAIL          = "device-name@letitrain.local"
+FIREBASE_PASSWORD       = "your-40-char-device-account-password"
+FIREBASE_DB_URL         = "https://letitrain-default-rtdb.firebaseio.com"
+FIREBASE_DEVICE_ID      = "your-unique-device-id"   ← see "Onboarding a new device" above
+FIREBASE_STORAGE_BUCKET = "your-project-id.appspot.com"
+# FIREBASE_EXPECTED_UID = "..."   ← optional, leave commented out on first boot; see below
+```
+
+`FIREBASE_EXPECTED_UID` is an optional cross-check, not something you fill
+in up front: after this device's first successful boot
+(`journalctl -u letitrain` shows "Firebase: authenticated OK"), find its UID
+in Firebase Console → Authentication → Users and paste it in. Every later
+boot then loudly warns if these credentials ever end up on the wrong
+physical device (e.g. a friend's `device_secrets.py` copied onto this one
+by mistake) instead of failing silently/confusingly via a rejected write
+several steps later.
+
+Unlike the Pico build, WiFi and NTP are OS-managed (NetworkManager,
+`systemd-timesyncd`), not configured in `device_secrets.py` — see
+`RPI/deploy/README.md`, including its section on switching a device between
+networks (e.g. testing on your own WiFi before deploying to a friend's).
+
+---
+
+## OTA Updates (git tags)
+
+Replaces the old Pico build's Firebase-Storage-manifest downloader entirely
+— that mechanism (`update/updater.py` at the repo root) was MicroPython-only
+and never applicable once the device became a normal Linux git clone.
+Releases are now just git tags (`vX.Y.Z`, or `X.Y.Z`), applied via
+`git fetch` + `git checkout` in place.
+
+**No push notifications yet** — the device checks Firebase for the app to
+read, and the app shows a badge; there's no APNs/FCM wiring to actively
+notify you. See `RPI/firebase/update_checker.py` and `main.py`'s
+`update_loop` for the actual mechanism.
+
+- Every 6 hours (or immediately on a manual "Check Now"/"Update Now" tap),
+  the device fetches tags from `origin`, compares the highest version-shaped
+  tag to its own `FIRMWARE_VERSION`, and writes the result to
+  `devices/{id}/update` in Firebase.
+- The iOS Dashboard shows an amber badge + the available version when one's
+  found, with an "Update Now" button. Tapping it writes
+  `update/apply_requested: true` — works in both local and remote mode,
+  since the security rules already allow the assigned app user to write
+  this node.
+- The device applies the update (`git fetch` + `checkout <tag>`) the next
+  time it polls and sees that flag, **deferring instead of interrupting** if
+  a zone happens to be running at that moment. A successful checkout ends
+  the process; `systemd`'s `Restart=always` relaunches it running the newly
+  checked-out code.
+
+**Two operational prerequisites**, not yet automated:
+1. `git` refuses to operate across a UID mismatch between the repo owner and
+   the user running it (the systemd service runs as root; the repo is
+   typically cloned as your regular user) — run once per device:
    ```
-   rules_version = '2';
-   service firebase.storage {
-     match /b/{bucket}/o {
-       match /ota/{allPaths=**} {
-         allow read: if request.auth != null;
-         allow write: if false;   // uploads only via Console/gsutil, never from a client
-       }
-     }
-   }
+   sudo git config --global --add safe.directory /opt/letitrain
    ```
-3. Copy the bucket name shown at the top of the Storage panel (e.g. `letitrain-75815.appspot.com`) into `secrets.py`'s `FIREBASE_STORAGE_BUCKET`.
+2. `RPI/config.json` is both tracked in git *and* the live file the running
+   service mutates constantly (zone names, schedules, etc.) — `git checkout`
+   will refuse to run while it has uncommitted changes, which it always
+   will in normal operation. This currently blocks every real apply attempt
+   until resolved (e.g. by gitignoring `config.json` in favor of a shipped
+   template, similar to `device_secrets.py`) — not yet done as of this
+   writing.
 
-### Publishing an update
-1. Bump the version in `version.json`.
-2. Upload the changed files to Storage under `ota/{version}/{same relative path as on-device}` — e.g. `ota/1.3.0/main.py`, `ota/1.3.0/hardware/status_led.py`.
-3. Upload/overwrite `ota/manifest.json`:
-   ```json
-   {
-     "version": "1.3.0",
-     "files": [
-       {"path": "main.py"},
-       {"path": "hardware/status_led.py"}
-     ],
-     "deletes": [
-       "hardware/old_module.py"
-     ]
-   }
-   ```
-   Only list files that changed — `check_for_update()` in `update/updater.py` overwrites exactly what's listed, nothing else. There is no way to signal a deletion by omission: `files` can only add or overwrite, since there's nothing in Storage to download for a file that should stop existing. If a release removes a file from the repo, add its path to `deletes` (optional key) so devices that already have it get it removed; `os.remove()` failing because it's already absent is treated as success.
-4. Every Pico polling that bucket picks it up within `UPDATE_CHECK_INTERVAL` (6 hours), immediately on its next boot, or immediately if triggered manually from the app (below).
-
-Check `update_status.json` on the device (via Thonny), or `devices/{id}/update` in Firebase, for the current state (`idle` / `checking` / `downloading` / `staged` / `error`) if an update doesn't seem to be landing.
-
-### Manual "check now" from the app
-The Dashboard's Device Info card has a "Check for Update" button.
-- **Local mode**: posts directly to the Pico's `/check-update` HTTP endpoint, which runs `check_for_update()` immediately in that request — instant, no Firebase round-trip.
-- **Remote mode**: writes `devices/{id}/update/requested = true` in Firebase instead, since there's no direct connection to the Pico. The Pico only checks that flag once during its batched cloud-sync pass (see Architecture above), so a remote-triggered check can take up to 15 minutes to be picked up — an acceptable trade for not needing frequent background TLS traffic. Current status/progress is pushed to the same `update` node during that same pass.
+Publishing a release: bump whatever needs bumping, commit, then
+`git tag vX.Y.Z && git push --tags`. Devices pick it up on their next poll.
 
 ---
 
 ## Clock Sync
 
-The Pico syncs its clock from NTP at boot, mirrors it into the DS3231 (if wired), and re-syncs automatically **once daily at 3am local time** — the DS3231's own crystal drifts a little over weeks/months of continuous uptime, and this controller is meant to run for a long time between reboots. NTP is plain UDP (port 123), not TLS, so this doesn't compete with the WiFi-chip concerns the rest of this document is careful about — it's fine for this to run on its own schedule, independent of the batched Firebase cloud-sync pass.
+The system clock is kept correct primarily by `systemd-timesyncd` (NTP)
+once the device has network access — no code here manages that directly.
+The DS3231 RTC, if wired, is optional (see `RPI/hardware/GPIO_PINOUT.md`
+for why): it seeds the system clock at boot only if the clock looks
+obviously wrong (before year 2020 — a sign `fake-hwclock`'s snapshot and
+NTP both haven't run yet), and is mirrored from the OS-synced clock once an
+hour afterward to correct for its own crystal drift over long uptimes.
 
-**Manual resync**: the Dashboard's Device Info card has a "Resync Time" button, local mode only — it posts directly to the Pico's `POST /resync-time` endpoint for an instant resync. This isn't offered remotely; the daily automatic job already covers the underlying need without a Firebase round-trip.
+**Manual resync**: the Dashboard's Device Info card has a "Resync Time"
+button, local mode only — posts directly to the device's
+`POST /resync-time` endpoint. Not offered remotely since there's no daily
+automatic job depending on it the way the old Pico build had.
 
 ---
 
 ## Boot Diagnostics
 
-Every boot writes `boot_log.json` to the device's flash, readable via `GET /boot-log` on the local network (e.g. `http://<pico-ip>/boot-log` from a browser, or `curl`) — no serial console or physical access required. Useful when the board is somewhere inconvenient to reach (this is local-network only, same as every other endpoint here — it's not reachable from outside your Wi-Fi).
+Every boot writes `boot_log.json` next to `main.py`, readable via
+`GET /boot-log` on the local network (e.g. `http://<device-ip>/boot-log`
+from a browser, or `curl`) — no SSH session or physical access required.
 
-Fields: `firmware_version`, `zones_configured`, `lcd_present`, `rtc_present`, `wifi_connected`, `local_ip`, `wifi_error`, `ntp_synced`, `boot_epoch`, `firebase_auth_ok`, `firebase_auth_error`, `firebase_uid`, `expected_uid_mismatch`, `device_owner_uid_claimed` (`true`/`false`/`null` if never attempted because auth failed), `heap_total_bytes`, `free_mem_bytes_at_boot`.
+Fields: `firmware_version`, `zones_configured`, `lcd_present`, `rtc_present`,
+`local_ip`, `network_reachable`, `firebase_auth_ok`, `firebase_auth_error`,
+`firebase_uid`, `expected_uid_mismatch`, `device_owner_uid_claimed`
+(`true`/`false`/`null` if never attempted because auth failed).
 
-If the endpoint 404s with "no boot log available yet," the device hasn't rebooted since this feature was added — power-cycle it once.
+If the endpoint 404s with "no boot log available yet," the device hasn't
+booted since this feature was added — restart the service once.
 
 ---
 
@@ -348,9 +320,9 @@ See `ios/README.md` for Xcode setup, Firebase SDK, and App Store submission step
 
 ---
 
-## Future: IFTTT Rain Skip (v1.2)
-See `cloud_functions/ifttt_rain_hook.js` for full implementation documentation.  
-The database schema and Pico firmware already support this — it's ready to be wired up.
+## Future: IFTTT Rain Skip
+See `cloud_functions/ifttt_rain_hook.js` for full implementation documentation.
+The database schema and device firmware already support this — it's ready to be wired up.
 
 ---
 
@@ -358,28 +330,44 @@ The database schema and Pico firmware already support this — it's ready to be 
 
 ```
 LetItRain/
-├── main.py                    ← Pico entry point (rewritten v1.1)
-├── secrets.py                 ← Wi-Fi + Firebase credentials (fill in before flash)
-├── config.json                ← Device config (persisted on Pico flash)
-├── version.json               ← 1.1.0
-├── netcfg/wifi.py            ← Wi-Fi connection helper
-├── firebase/
-│   ├── client.py              ← Firebase REST client (MicroPython)
-│   ├── status_writer.py       ← Writes status/meta to Firebase
-│   └── override_reader.py     ← Reads skip-for-N-days overrides from Firebase
-├── web/server.py              ← Local HTTP JSON API (trimmed, no HTML UI)
-├── core/                      ← Scheduler + state (unchanged)
-├── hardware/                  ← Relay + DS3231 (unchanged)
-├── storage/                   ← Config persistence (unchanged)
-├── cloud_functions/           ← Firebase Cloud Functions (Node.js)
-│   └── ifttt_rain_hook.js     ← STUB: IFTTT rain integration (v1.2)
-└── ios/                       ← iOS SwiftUI app source
-    ├── README.md              ← Xcode setup instructions
-    └── LetItRain/
-        ├── LetItRainApp.swift
-        ├── Managers/ConnectionManager.swift
-        ├── ViewModels/
-        ├── Networking/
-        ├── Models/
-        └── Views/
+├── README.md                      ← this file
+├── manifest.json                  ← legacy: old Pico Storage-manifest OTA scheme, superseded by git-tag updates above
+├── update/updater.py              ← legacy: Pico-only OTA downloader (ujson/urequests), not used by RPI/
+├── docs/SETUP_CHECKLIST.md        ← legacy: Pico 2 relay wiring, superseded by RPI/hardware/GPIO_PINOUT.md
+├── RPI/                           ← current device firmware/software (Raspberry Pi 3 A+, CPython)
+│   ├── main.py                    ← entry point — boot sequence + all background tasks
+│   ├── device_secrets.py          ← gitignored, per-device Firebase credentials (see setup above)
+│   ├── config.json                ← device config: zones, schedule, timezone (see OTA section's caveat)
+│   ├── version.json
+│   ├── requirements.txt
+│   ├── deploy/
+│   │   ├── README.md              ← full first-boot setup sequence
+│   │   └── letitrain.service      ← systemd unit
+│   ├── hardware/
+│   │   ├── GPIO_PINOUT.md         ← wiring reference for a new physical build
+│   │   ├── relay.py               ← multi-zone relay control (gpiozero)
+│   │   ├── status_led.py          ← boot/connectivity indicator LEDs
+│   │   ├── lcd1602.py             ← 16x2 LCD driver (I2C/MCP23008 — see GPIO_PINOUT.md)
+│   │   ├── lcd_status.py          ← LCD content composition
+│   │   └── ds3231.py              ← optional RTC driver (I2C1)
+│   ├── firebase/
+│   │   ├── client.py              ← Firebase REST client (httpx/asyncio)
+│   │   ├── status_writer.py       ← status/meta pushes
+│   │   ├── override_reader.py     ← skip-override reads
+│   │   ├── schedule_sync.py       ← zones/schedule push (immediate-on-save + periodic)
+│   │   └── update_checker.py      ← git-tag OTA detection/application
+│   ├── web/server.py              ← local FastAPI JSON API
+│   ├── core/                      ← scheduler, controller state, time helpers
+│   └── storage/config_store.py    ← config.json persistence
+├── ios/                            ← iOS SwiftUI app source
+│   ├── README.md                  ← Xcode setup instructions
+│   └── LetItRain.iOS/
+│       ├── LetItRainApp.swift
+│       ├── Managers/ConnectionManager.swift
+│       ├── ViewModels/
+│       ├── Networking/
+│       ├── Models/
+│       └── Views/
+└── cloud_functions/                ← Firebase Cloud Functions (Node.js)
+    └── ifttt_rain_hook.js          ← STUB: IFTTT rain integration, not yet wired up
 ```
